@@ -209,3 +209,66 @@ std::string status()
 }
 
 }
+
+// WF_RECORD=<file.mp4> with WF_RECORD_FRAMES=a-b (presented frames) or WF_RECORD_ARRIVAL=a-b (frames after the
+// playtest arrives): every TV frame in the range is piped to ffmpeg (WF_FFMPEG, default "ffmpeg") at WF_FPS (60).
+// Run with WF_FPS_FIXED=1 so the game clock follows frames rather than time while encoding slows it down.
+namespace {
+FILE* g_recordPipe = nullptr;
+bool g_recordDone = false;
+}
+
+bool wf_record_wants_frame()
+{
+    static const char* out = std::getenv("WF_RECORD");
+    if (!out || g_recordDone) return false;
+    static uint32 first = 0, last = 0;
+    static bool relative = false, init = false;
+    if (!init)
+    {
+        init = true;
+        if (const char* r = std::getenv("WF_RECORD_ARRIVAL"))
+        {
+            std::sscanf(r, "%u-%u", &first, &last);
+            relative = true;
+        }
+        else if (const char* r = std::getenv("WF_RECORD_FRAMES"))
+            std::sscanf(r, "%u-%u", &first, &last);
+    }
+    uint32 base = 0;
+    if (relative && !(base = wf::playtest::arrival_frame())) return false;
+    uint32 frame = LatteGPUState.frameCounter;
+    if (frame < base + first) return false;
+    if (frame > base + last)
+    {
+        if (g_recordPipe)
+        {
+            _pclose(g_recordPipe);
+            g_recordPipe = nullptr;
+            wf::log_info("record: finished {}", out);
+        }
+        g_recordDone = true;
+        return false;
+    }
+    return true;
+}
+
+void wf_record_frame(const std::vector<uint8>& rgb, int width, int height)
+{
+    if (!g_recordPipe)
+    {
+        const char* ffmpeg = std::getenv("WF_FFMPEG") ? std::getenv("WF_FFMPEG") : "ffmpeg";
+        int fps = std::getenv("WF_FPS") ? std::atoi(std::getenv("WF_FPS")) : 60;
+        std::string cmd = std::format("\"\"{}\" -y -loglevel error -f rawvideo -pix_fmt rgb24 -s {}x{} -r {} -i - -c:v libx264 -preset medium "
+                                      "-crf 14 -pix_fmt yuv420p \"{}\"\"",
+                                      ffmpeg, width, height, fps, std::getenv("WF_RECORD"));
+        g_recordPipe = _popen(cmd.c_str(), "wb");
+        if (!g_recordPipe)
+        {
+            g_recordDone = true;
+            return;
+        }
+        wf::log_info("record: {}x{} at {} fps to {}", width, height, fps, std::getenv("WF_RECORD"));
+    }
+    std::fwrite(rgb.data(), 1, rgb.size(), g_recordPipe);
+}

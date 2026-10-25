@@ -185,9 +185,10 @@ void update()
     if (std::getenv("WF_FAST_FORWARD")) g_fastForward = true;
     if (ui::menu::is_open())
         s = ProState{};
-    if (!g_script.empty())
+    static const bool fromArrival = std::getenv("WF_INPUT_ARRIVAL") != nullptr;  // script frames count from the playtest's arrival
+    if (!g_script.empty() && (!fromArrival || playtest::arrival_frame()))
     {
-        uint32_t frame = gpu::frame_count();
+        uint32_t frame = gpu::frame_count() - (fromArrival ? playtest::arrival_frame() : 0);
         for (const ScriptStep& step : g_script)
         {
             if (frame < step.start || frame >= step.end) continue;

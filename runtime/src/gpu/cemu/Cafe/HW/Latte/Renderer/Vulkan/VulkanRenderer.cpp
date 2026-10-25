@@ -1005,8 +1005,16 @@ bool VulkanRenderer::IsPadWindowActive()
 	return IsSwapchainInfoValid(false);
 }
 
+bool wf_record_wants_frame();
+void wf_record_frame(const std::vector<uint8>& rgb, int width, int height);
+
 void VulkanRenderer::HandleScreenshotRequest(LatteTextureView* texView, bool padView)
 {
+	// Windfall: recording (gpu.cpp, WF_RECORD) takes every TV frame here, in order, on this thread
+	static bool s_recordingFrame = false;
+	s_recordingFrame = !padView && !m_screenshot_requested && wf_record_wants_frame();
+	if (s_recordingFrame)
+		m_screenshot_requested = true;
 	if (!m_screenshot_requested && m_screenshot_state == ScreenshotState::None)
 		return;
 
@@ -1272,7 +1280,12 @@ void VulkanRenderer::HandleScreenshotRequest(LatteTextureView* texView, bool pad
 	if (imageMemory)
 		vkFreeMemory(m_logicalDevice, imageMemory, nullptr);
 
-	if (formatValid)
+	if (formatValid && s_recordingFrame)
+	{
+		m_screenshot_requested = false;
+		wf_record_frame(rgb_data, width, height);
+	}
+	else if (formatValid)
 		SaveScreenshot(rgb_data, width, height, !padView);
 }
 
