@@ -1460,11 +1460,41 @@ PPC_FUNC(hook_tick_collision)
     sub_02518798_orig(ctx, base);
 }
 
+// The draw phase uses the game's random numbers (cM_rnd, seeds at 101FF9D4): lantern and torch light flicker is rolled
+// as each actor is drawn. A drawing-only frame replays the numbers of its tick's draw, so lights flicker at the game's
+// rate, and the random sequence the game logic sees doesn't depend on how many frames were drawn.
+namespace wf::game {
+constexpr uint32_t kRandomSeeds = 0x101FF9D4;
+std::array<uint32_t, 3> g_rngDrawStart{}, g_rngDrawEnd{};
+bool g_rngValid = false;
+std::array<uint32_t, 3> rng_get() { return {rd32(kRandomSeeds), rd32(kRandomSeeds + 4), rd32(kRandomSeeds + 8)}; }
+void rng_set(const std::array<uint32_t, 3>& v)
+{
+    for (int i = 0; i < 3; i++) wr32(kRandomSeeds + 4 * i, v[i]);
+}
+}
+
 PPC_FUNC(hook_draw_handler)
 {
     bool was = game::t_inDraw;
     game::t_inDraw = true;
+    static const bool noRng = std::getenv("WF_60FPS_NORNG") != nullptr;  // test switch
+    bool replay = game::enabled() && !was && !noRng;
+    if (replay && game::g_logicFrame) game::g_rngDrawStart = game::rng_get();
+    else if (replay && game::g_rngValid) game::rng_set(game::g_rngDrawStart);
     sub_025DE37C_orig(ctx, base);
+    if (replay && game::g_logicFrame)
+    {
+        game::g_rngDrawEnd = game::rng_get();
+        game::g_rngValid = true;
+    }
+    static const bool rngLog = std::getenv("WF_60FPS_RNGLOG") != nullptr;
+    static int s_rngLogs = 0;
+    if (rngLog && game::g_frame > 2340 && s_rngLogs++ < 30)
+        log_info("draw phase frame {} {} nested {} start {:08X} end {:08X} now {:08X}", game::g_frame.load(), game::g_logicFrame ? "logic" : "draw", was,
+                 game::g_rngDrawStart[0], game::g_rngDrawEnd[0], rd32(game::kRandomSeeds));
+    else if (replay && game::g_rngValid)
+        game::rng_set(game::g_rngDrawEnd);
     game::t_inDraw = was;
 }
 
@@ -1701,6 +1731,9 @@ void draw_only_frame(PPCContext& ctx)
 {
     constexpr uint32_t kFrameCounter = 0x101FF560;
     uint32_t counter = rd32(kFrameCounter);
+    static const bool noRng = std::getenv("WF_60FPS_NORNG") != nullptr;
+    bool replay = g_rngValid && !noRng;
+    if (replay) rng_set(g_rngDrawStart);
     swap_camera_block(ctx);
     uint32_t ctxObj = hle::call_guest(ctx, 0x025EE048);
     uint32_t old = 1;
@@ -1709,6 +1742,7 @@ void draw_only_frame(PPCContext& ctx)
     hle::call_guest(ctx, kFpcDwHandler, {kFpcDrawIterater, draw_filter_thunk()});
     if (old != 1) hle::call_guest(ctx, 0x02756170, {rd32(0x101F8B4C), old});
     wr32(kFrameCounter, counter);
+    if (replay) rng_set(g_rngDrawEnd);
 }
 }
 
