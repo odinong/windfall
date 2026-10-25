@@ -5,7 +5,7 @@ game's PowerPC code gets translated to C++ and compiled into a native Windows pr
 runtime. The graphics side uses Cemu's Vulkan renderer, adapted to run inside the port.
 
 **You need your own copy of the game. Nothing from the game is included in this repo or in the releases.**
--# alot of this project was assisted by DeepSeek V4.1 Flash being ran locally (just thought id point that out there)
+### alot of this project was assisted by DeepSeek V4.1 Flash being ran locally (just thought id point that out there)
 
 ## Getting started
 
