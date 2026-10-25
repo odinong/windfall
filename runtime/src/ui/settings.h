@@ -1,4 +1,5 @@
 #pragma once
+#include <filesystem>
 #include <array>
 #include <cstdint>
 #include <map>
@@ -86,6 +87,7 @@ Settings defaults();
 void set_default_bindings(Settings& s);
 
 void load();
+void load_from(const std::filesystem::path& path);
 void save();
 void apply();
 void apply_audio();

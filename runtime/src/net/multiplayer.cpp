@@ -29,6 +29,7 @@
 #include "core/places.h"
 #include "ui/menu.h"
 #include "ui/settings.h"
+#include "enhancements/randomizer.h"
 #include "enhancements/camera.h"
 
 namespace wf::mp {
@@ -75,6 +76,7 @@ struct Remote
     std::map<uint16_t, std::deque<PoseSnapshot>> poses;
     struct RigidSnapshot { double time; std::vector<int16_t> q; };
     std::map<uint32_t, std::deque<RigidSnapshot>> rigid;
+    std::string world;  // the randomized world they play (rando::playing_world), empty for the original game
 };
 
 using Clock = std::chrono::steady_clock;
@@ -103,6 +105,7 @@ std::vector<std::string> g_outbox;
 constexpr uint32_t kItemSlots[2] = {0x14822BCC, 0x148D1B40};
 constexpr int kItemSlotCount = 21;
 constexpr uint8_t kEventItem = 1;
+constexpr uint8_t kEventWorld = 2;  // payload: the sender's rando::playing_world() text, resent every few seconds
 uint8_t g_itemsSeen[kItemSlotCount];
 bool g_itemsKnown = false, g_itemsAnnounced = false;
 std::vector<std::pair<uint8_t, uint8_t>> g_itemsIn;
@@ -245,10 +248,22 @@ void handle(const uint8_t* d, int n)
         break;
     }
     case 'E':
-        if (n >= 9 && d[6] == kEventItem && d[7] < kItemSlotCount && d[1] != g_id)
+        if (n >= 7 && d[1] != g_id)
         {
             std::lock_guard lk(g_lock);
-            g_itemsIn.push_back({d[7], d[8]});
+            auto it = g_remotes.find(d[1]);
+            if (d[6] == kEventWorld && it != g_remotes.end())
+            {
+                std::string world((const char*)d + 7, n - 7);
+                if (it->second.world != world)
+                    log_info("mp: {} plays {}", it->second.name, world.empty() ? "the original game" : "a randomizer seed");
+                it->second.world = std::move(world);
+            }
+            // items only go between players of the same world: in different randomizer seeds (or the original game)
+            // the same item unlocks different things
+            else if (n >= 9 && d[6] == kEventItem && d[7] < kItemSlotCount && it != g_remotes.end() &&
+                     it->second.world == rando::playing_world())
+                g_itemsIn.push_back({d[7], d[8]});
         }
         break;
     case 'C':
@@ -442,6 +457,16 @@ void run()
             {
                 seq++;
                 pkt.assign({'E', (uint8_t)g_id.load(), (uint8_t)seq, (uint8_t)(seq >> 8), (uint8_t)(seq >> 16), (uint8_t)(seq >> 24), kEventItem, slot, item});
+                send_pkt(pkt);
+            }
+            static double s_worldSent = 0;
+            if (t - s_worldSent > 3.0)
+            {
+                s_worldSent = t;
+                seq++;
+                const std::string& world = rando::playing_world();
+                pkt.assign({'E', (uint8_t)g_id.load(), (uint8_t)seq, (uint8_t)(seq >> 8), (uint8_t)(seq >> 16), (uint8_t)(seq >> 24), kEventWorld});
+                pkt.insert(pkt.end(), world.begin(), world.begin() + std::min<size_t>(world.size(), 3000));
                 send_pkt(pkt);
             }
         }
@@ -673,10 +698,10 @@ std::vector<PlayerInfo> room_info()
     int8_t hereRoom = (int8_t)rd8(kStartStage + 10);
     std::lock_guard lk(g_lock);
     if (!g_joined) return out;
-    out.push_back({g_name, g_color.load(), true, place_name(here, hereRoom)});
+    out.push_back({g_name, g_color.load(), true, place_name(here, hereRoom), rando::playing_world(), true});
     for (const auto& [id, r] : g_remotes)
     {
-        PlayerInfo p{r.name, r.color, false, {}};
+        PlayerInfo p{r.name, r.color, false, {}, r.world, r.world == rando::playing_world()};
         if (!r.snaps.empty())
         {
             const LinkView& v = r.snaps.back().view;

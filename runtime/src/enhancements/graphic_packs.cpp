@@ -1,10 +1,15 @@
 #include "Common/precompiled.h"
 #include "Cafe/HW/Latte/ISA/LatteReg.h"
 #include "Cafe/GraphicPack/GraphicPack2.h"
+#include "Cafe/HW/Latte/Core/Latte.h"
+#include "Cafe/HW/Latte/Core/LatteShader.h"
+#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
 
 #include "enhancements/graphic_packs.h"
 
+#include <array>
 #include <cmath>
+#include <optional>
 #include <fstream>
 #include <mutex>
 #include <regex>
@@ -209,6 +214,7 @@ std::vector<Pack> g_packs;
 std::map<std::tuple<uint64_t, uint64_t, int>, std::string> g_shaders;
 struct DataPatch { uint32_t addr; std::string kind; std::string expr; };
 std::vector<std::pair<const Pack*, std::vector<DataPatch>>> g_patches;
+std::map<uint32_t, std::array<uint8_t, 8>> g_patchOriginals;  // the game's bytes under each data patch, to undo it
 
 void parse_rules(Pack& pk, const fs::path& rules)
 {
@@ -433,17 +439,24 @@ const Pack* resolution_pack()
     return nullptr;
 }
 
+// The Resolution pack keeps the choice made at launch: the game sizes some of its buffers once, and recreating them
+// while playing leaves a few at the old size (the menu says it applies after a restart)
+std::optional<settings::Settings> g_launchSettings;
+
 void activate()
 {
-    settings::Settings s;
+    settings::Settings now;
     {
         std::lock_guard lk(settings::lock());
-        s = settings::get();
+        now = settings::get();
     }
+    if (!g_launchSettings) g_launchSettings = now;
     const std::vector<Pack>& all = packs();
+    const Pack* res = resolution_pack();
     std::lock_guard lk(g_lock);
     for (const Pack& pk : all)
     {
+        const settings::Settings& s = &pk == res ? *g_launchSettings : now;
         if (!settings::pack_enabled(s, pk.id) || !pk.supported()) continue;
         std::set<std::string> ints;
         std::map<std::string, std::string> vars = pack_vars(pk, s, &ints);
@@ -535,6 +548,12 @@ void apply_data_patches()
         for (const DataPatch& d : list)
         {
             if (!is_mapped(d.addr, 8)) continue;
+            if (!g_patchOriginals.count(d.addr))
+            {
+                std::array<uint8_t, 8> orig;
+                for (uint32_t i = 0; i < 8; i++) orig[i] = rd8(d.addr + i);
+                g_patchOriginals[d.addr] = orig;
+            }
             double v = std::strtod(d.expr.c_str(), nullptr);
             if (d.kind == "float") wr32(d.addr, std::bit_cast<uint32_t>((float)v));
             else if (d.kind == "double")
@@ -555,6 +574,78 @@ void apply_data_patches()
     if (!g_patches.empty()) log_info("graphic packs: data patches applied");
 }
 
+// the settings that decide what the active packs do: the pack options, and the window size for "Match window"
+std::string pack_signature()
+{
+    std::map<std::string, std::string> packs;
+    {
+        std::lock_guard lk(settings::lock());
+        packs = settings::get().packs;
+    }
+    std::string sig;
+    for (const auto& [k, v] : packs)
+        if (k.find("/Graphics/Resolution]") == std::string::npos) sig += k + "=" + v + ";";
+    return sig;
+}
+
+// on the GPU thread between frames: a change to the graphic packs in the menu is applied on the spot. The packs are
+// built again; when their texture rules or shaders changed, every texture (render targets at their new size) and
+// shader is recreated from the game's memory as the next frame draws them
+void frame_check()
+{
+    static std::string s_applied;
+    static bool s_started = false;
+    static uint32_t s_frames = 0;
+    if (s_frames++ % 15) return;
+    std::string sig = pack_signature();
+    if (!s_started)
+    {
+        s_started = true;
+        s_applied = sig;
+        return;
+    }
+    if (sig == s_applied) return;
+    s_applied = sig;
+    std::map<std::tuple<uint64_t, uint64_t, int>, std::string> oldShaders;
+    std::string oldRules;
+    auto rules_text = [] {
+        std::string t;
+        for (const auto& gp : GraphicPack2::s_active)
+            for (const auto& r : gp->m_textureRules)
+                t += fmt::format("{},{},{},{},{},{},{},{};", r.filter_settings.width, r.filter_settings.height, r.overwrite_settings.width,
+                                 r.overwrite_settings.height, r.overwrite_settings.format, r.overwrite_settings.lod_bias,
+                                 r.overwrite_settings.relative_lod_bias, r.overwrite_settings.anistropic_value);
+        return t;
+    };
+    {
+        std::lock_guard lk(g_lock);
+        oldShaders = g_shaders;
+        oldRules = rules_text();
+        for (const auto& [addr, orig] : g_patchOriginals)
+            for (uint32_t i = 0; i < 8; i++) wr8(addr + i, orig[i]);
+        g_patchOriginals.clear();
+        GraphicPack2::s_active.clear();
+        g_shaders.clear();
+        g_patches.clear();
+    }
+    activate();
+    apply_data_patches();
+    bool rebuild;
+    {
+        std::lock_guard lk(g_lock);
+        rebuild = oldShaders != g_shaders || oldRules != rules_text();
+    }
+    if (rebuild)
+    {
+        g_renderer->Flush(true);
+        if (auto* vk = VulkanRenderer::GetInstance()) vk->WaitDeviceIdle();
+        LatteTC_UnloadAllTextures();
+        LatteSHRC_UnloadAll();
+        LatteSHRC_ResetCachedShaderHash();
+    }
+    log_info("graphic packs: applied while playing{}", rebuild ? " (textures and shaders rebuilt)" : "");
+}
+
 const std::string* find_custom_shader(uint64_t baseHash, uint64_t auxHash, int type)
 {
     std::lock_guard lk(g_lock);
@@ -568,3 +659,5 @@ const std::string* wf_find_custom_shader(uint64 baseHash, uint64 auxHash, int ty
 {
     return wf::gp::find_custom_shader(baseHash, auxHash, type);
 }
+
+void wf_packs_frame_check() { wf::gp::frame_check(); }

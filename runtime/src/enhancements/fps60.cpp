@@ -77,7 +77,14 @@ int startup_fps()
     }();
     return fps;
 }
-bool enabled() { return startup_fps() > 30; }
+// the interpolated loop (frame rate above 30) is on; switches with the menu's setting while playing (follow_fps_setting)
+std::atomic<int> g_highFps{-1};
+bool enabled()
+{
+    int v = g_highFps.load(std::memory_order_relaxed);
+    if (v < 0) g_highFps = v = startup_fps() > 30;
+    return v != 0;
+}
 
 std::atomic<int> g_liveFps{0};
 int target_fps()
@@ -88,7 +95,7 @@ int target_fps()
 void follow_fps_setting()
 {
     static const bool overridden = std::getenv("WF_FPS") || std::getenv("WF_60FPS");
-    if (!enabled() || overridden) return;
+    if (overridden) return;
     static int s_setting = -1;
     int f;
     {
@@ -99,6 +106,7 @@ void follow_fps_setting()
     s_setting = f;
     if (f == 0) f = window::refresh_rate();
     if (f > 30) g_liveFps = std::clamp(f, 31, 1000);
+    g_highFps = f > 30;
 }
 
 std::atomic<uint32_t> g_frame{0};
@@ -1066,15 +1074,46 @@ namespace wf::game {
 void run_deferred_frame_ctrls(PPCContext& ctx);
 }
 
+// GX2SetSwapInterval: the game asks for 2 (30 Hz); the interpolated loop runs the frame loop every vsync
+std::atomic<uint32_t> g_requestedSwapInterval{2};
 uint32_t wf_game_swap_interval(uint32_t requested)
 {
+    g_requestedSwapInterval = requested;
     return (game::enabled() && requested == 2) ? 1 : requested;
+}
+
+void wf_set_swap_interval(uint32_t interval);
+void wf_render_reset_vsync();
+namespace wf::game {
+int g_rateApplied = 0;  // the frame rate the emulated vsync was last set for (0: set it again)
+// the frame rate setting moved between 30 and a higher rate while playing
+void switch_loop(bool high)
+{
+    if (!high)
+    {
+        restore_particles();
+        restore_effects();
+        g_step = 1.0f;
+        g_logicFrame = true;
+        g_fastForward = false;
+        wf_render_fast_forward(false);
+        wf_render_reset_vsync();
+        g_rateApplied = 0;
+    }
+    wf_set_swap_interval(wf_game_swap_interval(g_requestedSwapInterval));
+    log_info("frame rate: {}", high ? "interpolated loop on" : "original 30 fps loop");
+}
 }
 
 PPC_FUNC(hook_task_calc)
 {
     mp::new_frame();
     game::g_paused = game::paused_now();
+    {
+        bool wasHigh = game::enabled();
+        game::follow_fps_setting();
+        if (wasHigh != game::enabled()) game::switch_loop(game::enabled());
+    }
     if (!game::enabled())
     {
         game::g_logicFrame = !game::g_paused;
@@ -1090,7 +1129,6 @@ PPC_FUNC(hook_task_calc)
         return;
     }
     uint32_t frame = ++game::g_frame;
-    game::follow_fps_setting();
     if (const char* e = std::getenv("WF_60FPS_COUNTERFIND"))
     {
         static const uint32_t at = (uint32_t)std::atoi(e);
@@ -1114,13 +1152,13 @@ PPC_FUNC(hook_task_calc)
     static const bool lagLog = std::getenv("WF_60FPS_LAGLOG") != nullptr;
     if (lagLog && frame % 30 == 0) log_info("lag: game frame {} gpu frames presented {}", frame, gpu::frame_count());
     const int fps = game::target_fps();
-    static int s_fps = 0;
+    int& s_fps = game::g_rateApplied;
     static uint64_t s_simFrames = 0, s_lastTick = 0;
     static uint64_t s_lastNs = 0;
     static double s_realFrames = 0;
     if (fps != s_fps)
     {
-        if (s_fps) s_simFrames = s_lastTick * (uint64_t)fps / 30;
+        s_simFrames = s_lastTick * (uint64_t)fps / 30;  // the clock goes on from the last tick at the new rate
         s_lastNs = 0;
         s_fps = fps;
         wf_render_set_vsync_rate(fps);
@@ -1148,9 +1186,11 @@ PPC_FUNC(hook_task_calc)
             if (s_realFrames > (double)s_simFrames + 1.5) s_simFrames = (uint64_t)s_realFrames - 1;
             else if (s_realFrames < (double)s_simFrames - 3.0) s_realFrames = (double)s_simFrames;
         }
+        // behind the last tick (the clock was last counted at another rate): go on from that tick
+        if (s_lastTick && (s_simFrames + 1) * 30 <= (s_lastTick - 1) * (uint64_t)fps) s_simFrames = s_lastTick * (uint64_t)fps / 30;
         uint64_t i = ++s_simFrames, num = i * 30;
         uint64_t tick = (num + fps - 1) / fps;
-        logic = tick != s_lastTick;
+        logic = tick > s_lastTick;
         step = (float)(num - (tick - 1) * fps) / (float)fps;
         if (logic && tick > s_lastTick + 1) s_simFrames = (s_lastTick + 1) * (uint64_t)fps / 30;
     }

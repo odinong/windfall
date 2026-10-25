@@ -34,6 +34,8 @@ constexpr const char* kMatchWindow = "Match window";
 
 void activate();
 void apply_data_patches();
+// GPU thread, between frames: applies pack changes made in the menu
+void frame_check();
 
 const std::string* find_custom_shader(uint64_t baseHash, uint64_t auxHash, int type);
 

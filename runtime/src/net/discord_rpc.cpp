@@ -100,6 +100,25 @@ void run()
     std::string lastActivity;
     for (;;)
     {
+        bool wanted;
+        {
+            std::lock_guard lk(settings::lock());
+            wanted = settings::get().discordPresence;
+        }
+        if (!wanted)
+        {
+            // turned off in the menu: clear the status and let go of Discord until it's turned on again
+            if (g_pipe != INVALID_HANDLE_VALUE)
+            {
+                send_frame(1, std::format("{{\"cmd\":\"SET_ACTIVITY\",\"args\":{{\"pid\":{}}},\"nonce\":\"{}\"}}", GetCurrentProcessId(), ++nonce));
+                drain();
+                pipe_close();
+                log_info("discord: rich presence off");
+            }
+            lastActivity.clear();
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            continue;
+        }
         if (g_pipe == INVALID_HANDLE_VALUE)
         {
             if (!pipe_open())
@@ -160,11 +179,7 @@ void run()
 void start()
 {
     if (const char* e = std::getenv("WF_NO_DISCORD"); e && *e == '1') return;
-    {
-        std::lock_guard lk(settings::lock());
-        if (!settings::get().discordPresence) return;
-    }
-    std::thread(run).detach();
+    std::thread(run).detach();  // follows the setting while running
 }
 
 }

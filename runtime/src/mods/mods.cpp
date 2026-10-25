@@ -4,6 +4,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 
 #include <windows.h>
 
@@ -24,7 +25,11 @@ std::once_flag g_once;
 std::vector<Mod> g_mods;
 std::mutex g_lock;
 std::map<std::string, fs::path> g_resolved;
-std::vector<std::pair<WindfallFrameCallback, void*>> g_tick;
+struct TickCallback { WindfallFrameCallback cb; void* user; std::string mod; };
+std::vector<TickCallback> g_tick;
+std::string g_loadingPlugin;            // the mod whose windfall_mod_init is running (its callbacks are its own)
+std::set<std::string> g_loadedPlugins;  // plugins loaded this session (a DLL can't be unloaded safely: it is paused)
+std::map<std::string, bool> g_appliedMods;
 std::atomic<uint32_t> g_ticks{0};
 
 fs::path mods_dir()
@@ -142,7 +147,7 @@ uint8_t* api_ptr(uint32_t a) { return is_mapped(a, 1) ? (uint8_t*)gptr(a) : null
 void api_on_tick(WindfallFrameCallback cb, void* user)
 {
     std::lock_guard lk(g_lock);
-    if (cb) g_tick.push_back({cb, user});
+    if (cb) g_tick.push_back({cb, user, g_loadingPlugin});
 }
 uint32_t api_frames() { return gpu::frame_count(); }
 uint32_t api_ticks() { return g_ticks; }
@@ -162,11 +167,29 @@ const std::vector<Mod>& list()
     return g_mods;
 }
 
-void start()
+// applies the menu's mod choices while playing: content from the mods now enabled is used for the files the game loads
+// from here on (the next area), newly enabled plugins start, and disabled plugins stop getting called
+void sync()
 {
+    std::map<std::string, bool> on;
+    {
+        std::lock_guard lk(settings::lock());
+        on = settings::get().mods;
+    }
+    {
+        std::lock_guard lk(g_lock);
+        if (on == g_appliedMods) return;
+        g_appliedMods = on;
+        g_resolved.clear();
+    }
     for (const Mod* m : enabled())
     {
         if (!m->hasPlugin) continue;
+        {
+            std::lock_guard lk(g_lock);
+            if (!g_loadedPlugins.insert(m->folder).second) continue;
+            g_loadingPlugin = m->folder;
+        }
         HMODULE dll = LoadLibraryW((m->dir / "plugin.dll").c_str());
         auto init = dll ? (WindfallModInit)GetProcAddress(dll, "windfall_mod_init") : nullptr;
         if (!init)
@@ -177,8 +200,14 @@ void start()
         int r = init(&g_api);
         log_info("mods: {}: plugin started (returned {})", m->folder, r);
     }
+    {
+        std::lock_guard lk(g_lock);
+        g_loadingPlugin.clear();
+    }
     for (const Mod* m : enabled()) log_info("mods: {} enabled", m->name);
 }
+
+void start() { sync(); }
 
 fs::path resolve_content(const std::string& relPath, const fs::path& original)
 {
@@ -223,12 +252,16 @@ fs::path resolve_content(const std::string& relPath, const fs::path& original)
 void tick()
 {
     g_ticks++;
-    std::vector<std::pair<WindfallFrameCallback, void*>> cbs;
+    sync();
+    std::vector<TickCallback> cbs;
+    std::map<std::string, bool> on;
     {
         std::lock_guard lk(g_lock);
         cbs = g_tick;
+        on = g_appliedMods;
     }
-    for (auto& [cb, user] : cbs) cb(user);
+    for (auto& c : cbs)
+        if (c.mod.empty() || on[c.mod]) c.cb(c.user);
 }
 
 }

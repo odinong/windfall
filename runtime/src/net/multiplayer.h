@@ -19,6 +19,8 @@ struct PlayerInfo
     int color = 0;
     bool self = false;
     std::string place;
+    std::string world;       // the randomized world they play (rando::playing_world text), empty for the original game
+    bool sameWorld = true;   // the same as ours: items are shared with them
 };
 std::vector<PlayerInfo> room_info();
 uint32_t tunic_color(int color);

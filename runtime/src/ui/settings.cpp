@@ -244,11 +244,13 @@ Settings defaults()
     return s;
 }
 
-void load()
+void load() { load_from(file_path()); }
+
+void load_from(const std::filesystem::path& path)
 {
     std::lock_guard lk(lock());
     g_settings = defaults();
-    std::ifstream f(file_path());
+    std::ifstream f(path);
     std::map<std::string, std::string> kv;
     for (std::string line; std::getline(f, line);)
     {
@@ -382,9 +384,13 @@ namespace wf::settings {
 bool restart_pending()
 {
     std::lock_guard lk(lock());
-    return g_settings.packs != g_startup.packs || (g_settings.fps == 30) != (g_startup.fps == 30) || g_settings.mods != g_startup.mods ||
-           g_settings.randoEnabled != g_startup.randoEnabled ||
-           g_settings.discordPresence != g_startup.discordPresence;
+    auto resolution = [](const Settings& s) {
+        std::string v;
+        for (const auto& [k, x] : s.packs)
+            if (k.find("/Graphics/Resolution]") != std::string::npos) v += k + "=" + x + ";";
+        return v;
+    };
+    return g_settings.randoEnabled != g_startup.randoEnabled || resolution(g_settings) != resolution(g_startup);
 }
 
 bool pack_enabled(const Settings& s, const std::string& id)

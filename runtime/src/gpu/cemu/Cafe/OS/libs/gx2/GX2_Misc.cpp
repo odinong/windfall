@@ -29,6 +29,12 @@ void gx2Export_GX2SetSwapInterval(PPCInterpreter_t* hCPU)
 	osLib_returnFromFunction(hCPU, 0);
 }
 
+void wf_set_swap_interval(uint32 interval)
+{
+	if (LatteGPUState.sharedArea)
+		LatteGPUState.sharedArea->swapInterval = interval;
+}
+
 void gx2Export_GX2GetSwapInterval(PPCInterpreter_t* hCPU)
 {
 	cemuLog_log(LogType::GX2, "GX2GetSwapInterval()");

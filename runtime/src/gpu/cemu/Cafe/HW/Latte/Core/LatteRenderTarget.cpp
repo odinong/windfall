@@ -699,6 +699,7 @@ static void LatteRenderTarget_wfDrawGamePadOverlay(LatteTextureView* drcView)
 HRTick LatteTime_CalculateTimeBetweenVSync();
 extern HRTick g_wfLastVsyncSignal;
 void wf_menu_render();
+void wf_packs_frame_check();
 void wf_mp_render();
 void wf_explorer_render();
 static double s_wfSwapOffsetMs = 0; // time from the last vsync signal to reaching the swap, for statistics
@@ -726,6 +727,15 @@ void wf_render_set_vsync_rate(sint32 rate)
 	if (s_wfFastForward)
 		return;
 	LatteTiming_setCustomVsyncFrequency(emulated);
+}
+// back to the original 30 fps loop: the real 60 Hz vsync, and presents paced here again
+void wf_render_reset_vsync()
+{
+	s_wfVsyncRate = 60;
+	s_wfPacedByGame = false;
+	wf_gx2_set_vsync_rate(60);
+	if (!s_wfFastForward)
+		LatteTiming_disableCustomVsyncFrequency();
 }
 void wf_render_fast_forward(bool on)
 {
@@ -776,6 +786,7 @@ void LatteRenderTarget_itHLESwapScanBuffer()
 	LatteGPUState.frameCounter++;
 	LatteRenderTarget_wfPacePresent();
 	g_renderer->SwapBuffers(true, true);
+	wf_packs_frame_check();
 	{
 		static auto s_last = std::chrono::steady_clock::now();
 		static uint32 s_count = 0, s_bins[16] = {}, s_offBins[18] = {};

@@ -702,7 +702,7 @@ void tab_video(settings::Settings& s, bool& dirty)
             ImGui::EndCombo();
         }
         hint("The game's logic stays at 30 ticks per second (so it plays the same); every frame in between is "
-             "interpolated. Pick your monitor's refresh rate with V-Sync on. Switching to or from 30 fps applies after a restart.");
+             "interpolated. Pick your monitor's refresh rate with V-Sync on.");
     }
     dirty |= slider_int("Field of view", &s.fieldOfView, 40, 100, s.fieldOfView == 60 ? "60 (original)" : "%d");
     hint("The camera's vertical angle of view in degrees. Wider shows more around Link; the game's own is 60.");
@@ -942,200 +942,157 @@ void end_card(Card& c)
     ImGui::Dummy(ImVec2(c.width, ImGui::GetStyle().ItemSpacing.y));
 }
 
-void tunic_badge(ImDrawList* dl, ImVec2 center, float r, ImU32 color, const std::string& name)
-{
-    dl->AddCircleFilled(center, r, faded(color), 32);
-    dl->AddCircle(center, r, faded(IM_COL32(255, 250, 235, 255)), 32, 2.5f * g_uiScale);
-    std::string initial = name.empty() ? "?" : name.substr(0, 1);
-    ImFont* f = ImGui::GetFont();
-    float fs = r * 1.15f;
-    ImVec2 ts = f->CalcTextSizeA(fs, FLT_MAX, 0, initial.c_str());
-    ImVec2 at(center.x - ts.x * 0.5f, center.y - ts.y * 0.5f);
-    dl->AddText(f, fs, ImVec2(at.x + 1.5f * g_uiScale, at.y + 1.5f * g_uiScale), faded(IM_COL32(0, 0, 0, 140)), initial.c_str());
-    dl->AddText(f, fs, at, faded(IM_COL32(255, 255, 255, 255)), initial.c_str());
-}
-
 std::string random_room_code()
 {
-    static constexpr const char* kWords[] = {"KORL", "ARYLL", "TETRA", "MEDLI", "MAKAR", "TINGLE", "ORCA", "GALE", "ZEPHOS", "CYCLOS",
-                                             "JABUN", "VALOO", "GOHMA", "OUTSET", "WINDFALL", "BEEDLE", "KOMALI", "FADO", "LARUTO", "RITO"};
+    static constexpr char kChars[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";  // no 0/O or 1/I
     uint32 h = (uint32)(ImGui::GetTime() * 1000003.0) ^ (uint32)SDL_GetTicksNS();
-    h ^= h >> 13;
-    h *= 0x5bd1e995u;
-    h ^= h >> 15;
-    return std::string(kWords[h % std::size(kWords)]) + "-" + std::to_string(100 + (h >> 8) % 900);
+    std::string code;
+    for (int i = 0; i < 6; i++)
+    {
+        h ^= h >> 13;
+        h *= 0x5bd1e995u;
+        h ^= h >> 15;
+        code += kChars[h % (sizeof kChars - 1)];
+    }
+    return code;
+}
+
+// what a player plays, for the player list: the original game or a randomizer seed
+std::string world_label(const std::string& world)
+{
+    if (world.empty()) return "Original game";
+    std::string seed = rando::parse_world(world).seed;
+    return "Randomizer: " + (seed.empty() ? std::string("?") : seed);
 }
 
 void tab_multiplayer(settings::Settings& s, bool& dirty)
 {
-    float sc = g_uiScale;
     bool joined = mp::connected();
     std::string status = mp::status();
     std::vector<mp::PlayerInfo> players = mp::room_info();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
 
+    section("Connection");
     {
-        ImVec2 a = ImGui::GetCursorScreenPos();
-        float w = ImGui::GetContentRegionAvail().x, h = ImGui::GetFrameHeight() * 1.9f;
         bool connecting = !joined && status.find("onnecting") != std::string::npos;
-        ImU32 light = joined ? IM_COL32(90, 220, 120, 255) : connecting ? kGold : IM_COL32(150, 160, 180, 255);
-        dl->AddRectFilled(a, ImVec2(a.x + w, a.y + h), faded(IM_COL32(8, 26, 58, 170)), 14 * sc);
-        ink_rect(dl, a, ImVec2(a.x + w, a.y + h), IM_COL32(200, 214, 236, 150), 2.0f * sc, ImGui::GetID("banner"), 14 * sc);
-        float pulse = connecting ? 0.6f + 0.4f * std::sin((float)ImGui::GetTime() * 6.0f) : 1.0f;
-        ImVec2 dot(a.x + h * 0.5f, a.y + h * 0.5f);
-        dl->AddCircleFilled(dot, h * 0.2f * pulse + h * 0.06f, faded((light & 0x00FFFFFF) | 0x50000000), 24);
-        dl->AddCircleFilled(dot, h * 0.16f, faded(light), 24);
-        ImFont* f = ImGui::GetFont();
-        float big = ImGui::GetFontSize() * 1.25f;
-        std::string head = joined ? "Room " + mp::room_code() : connecting ? "Connecting..." : "Offline";
-        dl->AddText(f, big, ImVec2(a.x + h, a.y + h * 0.5f - big * 0.62f), faded(kText), head.c_str());
-        std::string sub = joined ? std::to_string(players.size()) + " of 8 players  -  " + status : status;
-        dl->AddText(f, ImGui::GetFontSize() * 0.8f, ImVec2(a.x + h, a.y + h * 0.5f + big * 0.18f), faded(kTextDim), sub.c_str());
-        ImGui::Dummy(ImVec2(w, h));
-        ImGui::Spacing();
+        ImU32 c = joined ? IM_COL32(110, 220, 130, 255) : connecting ? kGold : IM_COL32(150, 176, 210, 255);
+        std::string line = joined ? std::format("In room {} ({} of 8 players)", mp::room_code(), players.size()) : status;
+        ImGui::PushStyleColor(ImGuiCol_Text, col(c));
+        ImGui::TextUnformatted(line.c_str());
+        ImGui::PopStyleColor();
     }
-
-    if (ImGui::BeginTable("##mp", 2, ImGuiTableFlags_SizingStretchProp))
+    ImGui::BeginDisabled(joined);
+    float field = ImGui::GetContentRegionAvail().x * 0.5f;
+    if (text_field("Name", s.mpName, 15, field)) dirty = true;
+    hint("Shown over your head to the others in the room.");
     {
-        ImGui::TableSetupColumn("left", ImGuiTableColumnFlags_WidthStretch, 0.46f);
-        ImGui::TableSetupColumn("right", ImGuiTableColumnFlags_WidthStretch, 0.54f);
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0);
-
+        const char* roll = "Random";
+        float bw = ImGui::CalcTextSize(roll).x + ImGui::GetStyle().FramePadding.x * 4;
+        char buf[32] = {};
+        std::snprintf(buf, sizeof buf, "%s", joined ? mp::room_code().c_str() : s.mpRoom.c_str());
+        ImGui::SetNextItemWidth(field - bw - ImGui::GetStyle().ItemSpacing.x);
+        if (ImGui::InputText("##room", buf, 16, ImGuiInputTextFlags_CharsUppercase))
         {
-            Card c;
-            begin_card(c, "Your Link");
-            ImGui::BeginDisabled(joined);
-            if (text_field("##name", s.mpName, 15, c.inner)) dirty = true;
-            ImGui::EndDisabled();
-            ImGui::TextDisabled("%s", joined ? "The name over your head" : "The name the others see over your head");
+            s.mpRoom = buf;
+            dirty = true;
+        }
+        ImGui::SameLine();
+        if (button(roll, ImVec2(bw, 0)))
+        {
+            s.mpRoom = random_room_code();
+            dirty = true;
+        }
+        ImGui::SameLine();
+        ImGui::TextUnformatted("Room code");
+        hint("Everyone who enters the same code plays together (up to 8 players).");
+    }
+    int server = s.mpServer == kPublicServer ? 0 : 1;
+    ImGui::SetNextItemWidth(field);
+    if (combo("Server", server, {"Windfall public server", "Your own server"}))
+    {
+        if (server == 0) s.mpServer = kPublicServer;
+        else if (s.mpServer == kPublicServer) s.mpServer = "ws://";
+        dirty = true;
+    }
+    if (server == 1)
+    {
+        if (text_field("Address", s.mpServer, 120, field)) dirty = true;
+        hint("host:port for UDP, or a ws:// or wss:// address. The server is tools/mp_server/windfall_server.py.");
+    }
+    ImGui::EndDisabled();
+    if (!joined)
+    {
+        if (button("Join room"))
+        {
+            if (s.mpRoom.empty()) s.mpRoom = random_room_code();
+            mp::connect(s.mpServer, s.mpRoom, s.mpName);
+            dirty = true;
+        }
+    }
+    else if (button("Leave room"))
+        mp::disconnect();
+
+    section("Players");
+    if (!joined) ImGui::TextDisabled("Join a room to see who's playing.");
+    else if (ImGui::BeginTable("##players", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp))
+    {
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("Where", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+        for (const char* h : {"Name", "Where", "Game"})
+        {
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", h);
+        }
+        for (const mp::PlayerInfo& pl : players)
+        {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            // a small square in their tunic color, then the name
+            float sz = ImGui::GetTextLineHeight() * 0.7f;
             ImVec2 p = ImGui::GetCursorScreenPos();
-            float r = ImGui::GetFrameHeight() * 0.5f;
-            int myColor = joined && !players.empty() ? players[0].color : 0;
-            tunic_badge(ImGui::GetWindowDrawList(), ImVec2(p.x + r, p.y + r), r, mp::tunic_color(myColor), s.mpName);
-            ImGui::Dummy(ImVec2(r * 2, r * 2));
+            float y = p.y + (ImGui::GetTextLineHeight() - sz) * 0.5f;
+            ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(p.x, y), ImVec2(p.x + sz, y + sz), mp::tunic_color(pl.color), 2.0f * g_uiScale);
+            ImGui::Dummy(ImVec2(sz, sz));
             ImGui::SameLine();
-            static constexpr const char* kTunics[] = {"Green tunic", "Red tunic", "Blue tunic", "Purple tunic",
-                                                      "Gold tunic", "Orange tunic", "Teal tunic", "Pink tunic"};
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (r * 2 - ImGui::GetTextLineHeight()) * 0.5f);
-            if (joined) ImGui::TextUnformatted(kTunics[myColor & 7]);
-            else ImGui::TextDisabled("Tunic color: given when you join");
-            end_card(c);
-        }
-
-        {
-            Card c;
-            begin_card(c, "Room");
-            ImGui::BeginDisabled(joined);
-            float bw = ImGui::CalcTextSize("New code").x + ImGui::GetStyle().FramePadding.x * 4;
-            ImGui::SetNextItemWidth(c.inner - bw - ImGui::GetStyle().ItemSpacing.x);
+            ImGui::Text("%s%s", pl.name.c_str(), pl.self ? " (you)" : "");
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(pl.place.empty() ? "Title screen" : pl.place.c_str());
+            ImGui::TableNextColumn();
+            if (pl.sameWorld) ImGui::TextUnformatted(world_label(pl.world).c_str());
+            else
             {
-                char buf[32] = {};
-                std::snprintf(buf, sizeof buf, "%s", joined ? mp::room_code().c_str() : s.mpRoom.c_str());
-                if (ImGui::InputText("##room", buf, 16, ImGuiInputTextFlags_CharsUppercase))
-                {
-                    s.mpRoom = buf;
-                    dirty = true;
-                }
-            }
-            ImGui::SameLine();
-            if (button("New code", ImVec2(bw, 0)))
-            {
-                s.mpRoom = random_room_code();
-                dirty = true;
-            }
-            ImGui::TextDisabled("Friends who type the same code play together");
-            int server = s.mpServer == kPublicServer ? 0 : 1;
-            if (combo("##server", server, {"Windfall public server", "My own server"}))
-            {
-                if (server == 0) s.mpServer = kPublicServer;
-                else if (s.mpServer == kPublicServer) s.mpServer = "ws://";
-                dirty = true;
-            }
-            if (server == 1)
-            {
-                if (text_field("##address", s.mpServer, 120, c.inner)) dirty = true;
-                ImGui::TextDisabled("host:port (UDP) or a ws:// / wss:// address");
-            }
-            ImGui::EndDisabled();
-            ImGui::Spacing();
-            float h = ImGui::GetFrameHeight() * 1.5f;
-            if (!joined)
-            {
-                if (button("Join room", ImVec2(c.inner, h)))
-                {
-                    if (s.mpRoom.empty()) s.mpRoom = random_room_code();
-                    mp::connect(s.mpServer, s.mpRoom, s.mpName);
-                    dirty = true;
-                }
-            }
-            else if (button("Leave room", ImVec2(c.inner, h)))
-                mp::disconnect();
-            end_card(c);
-        }
-
-        ImGui::TableSetColumnIndex(1);
-        {
-            Card c;
-            begin_card(c, "Crew");
-            ImDrawList* cdl = ImGui::GetWindowDrawList();
-            float rowH = ImGui::GetTextLineHeight() * 2.3f, w = c.inner;
-            int rows = joined ? std::clamp((int)players.size() + 2, 4, 8) : 4;
-            for (int i = 0; i < rows; i++)
-            {
-                ImVec2 a = ImGui::GetCursorScreenPos(), b(a.x + w, a.y + rowH - 6 * sc);
-                if (i < (int)players.size())
-                {
-                    const mp::PlayerInfo& pl = players[(size_t)i];
-                    ImU32 tc = mp::tunic_color(pl.color);
-                    cdl->AddRectFilled(a, b, faded((tc & 0x00FFFFFF) | 0x38000000), 10 * sc);
-                    cdl->AddRectFilled(a, ImVec2(a.x + 6 * sc, b.y), faded(tc), 10 * sc, ImDrawFlags_RoundCornersLeft);
-                    float r = (b.y - a.y) * 0.36f;
-                    tunic_badge(cdl, ImVec2(a.x + 14 * sc + r, (a.y + b.y) * 0.5f), r, tc, pl.name);
-                    float tx = a.x + 24 * sc + 2 * r;
-                    std::string name = pl.name + (pl.self ? "  (you)" : "");
-                    cdl->AddText(ImVec2(tx, a.y + 3 * sc), faded(kText), name.c_str());
-                    std::string place = pl.place.empty() ? "On the title screen" : pl.place;
-                    cdl->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 0.78f, ImVec2(tx, a.y + ImGui::GetTextLineHeight() + 4 * sc),
-                                 faded(kTextDim), place.c_str());
-                }
-                else
-                {
-                    cdl->AddRectFilled(a, b, faded(IM_COL32(200, 214, 236, 14)), 10 * sc);
-                    cdl->AddRect(a, b, faded(IM_COL32(200, 214, 236, 40)), 10 * sc, 0, 1.5f * sc);
-                    const char* text = joined ? "Open - share the room code" : "Open";
-                    ImVec2 ts = ImGui::CalcTextSize(text);
-                    cdl->AddText(ImVec2(a.x + (w - ts.x) * 0.5f, (a.y + b.y - ts.y) * 0.5f), faded(IM_COL32(200, 214, 236, 90)), text);
-                }
-                ImGui::Dummy(ImVec2(w, rowH - ImGui::GetStyle().ItemSpacing.y));
-            }
-            end_card(c);
-        }
-
-        {
-            Card c;
-            begin_card(c, "Chat");
-            std::vector<mp::ChatEntry> chat = mp::recent_chat(5);
-            if (chat.empty()) ImGui::TextDisabled("%s", joined ? "No messages yet. Press Enter in game to chat." : "Join a room to chat.");
-            for (const mp::ChatEntry& e : chat)
-            {
-                ImU32 nc = e.color < 0 ? IM_COL32(255, 255, 255, 255) : mp::tunic_color(e.color);
-                ImGui::PushStyleColor(ImGuiCol_Text, col(nc));
-                ImGui::TextUnformatted((e.name + ":").c_str());
+                ImGui::PushStyleColor(ImGuiCol_Text, col(IM_COL32(255, 170, 120, 255)));
+                ImGui::TextUnformatted(world_label(pl.world).c_str());
                 ImGui::PopStyleColor();
-                ImGui::SameLine();
-                ImGui::TextWrapped("%s", e.text.c_str());
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Not the same game as yours, so items aren't shared with them. The Randomizer tab can make their seed.");
             }
-            end_card(c);
         }
         ImGui::EndTable();
     }
 
-    section("Co-op options");
+    section("Chat");
+    {
+        std::vector<mp::ChatEntry> chat = mp::recent_chat(6);
+        if (chat.empty()) ImGui::TextDisabled("%s", joined ? "No messages yet. Press Enter while playing to chat." : "Join a room to chat.");
+        for (const mp::ChatEntry& e : chat)
+        {
+            ImU32 nc = e.color < 0 ? IM_COL32(255, 255, 255, 255) : mp::tunic_color(e.color);
+            ImGui::PushStyleColor(ImGuiCol_Text, col(nc));
+            ImGui::TextUnformatted((e.name + ":").c_str());
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            ImGui::TextWrapped("%s", e.text.c_str());
+        }
+    }
+
+    section("Options");
     if (toggle("Join this room when the game starts", &s.mpAutoConnect)) dirty = true;
-    if (toggle("Names over the other players", &s.mpShowNames)) dirty = true;
+    if (toggle("Show names over the other players", &s.mpShowNames)) dirty = true;
     if (toggle("Share items with the room", &s.mpShareItems)) dirty = true;
-    hint("An item anyone gets goes into everyone's empty item slots (not rupees, hearts or ammo).");
+    hint("An item anyone picks up goes into everyone's empty item slots (not rupees, hearts or ammo). Only between players "
+         "of the same game: the original game, or the same randomizer seed.");
     if (slider_int("Chat stays on screen", &s.mpChatSeconds, 3, 60, "%d s")) dirty = true;
 }
 
@@ -1240,6 +1197,7 @@ bool rando_option(settings::Settings& s, const RandoOption& o)
     else if (o.type == 'i')
     {
         int n = std::atoi(v.c_str());
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);  // half the column: room for the label
         if (slider_int(id.c_str(), &n, o.lo, o.hi, "%d"))
         {
             s.randoOptions[o.key] = std::to_string(n);
@@ -1252,6 +1210,7 @@ bool rando_option(settings::Settings& s, const RandoOption& o)
         int idx = 0;
         for (int i = 0; i < (int)list.size(); i++)
             if (v == list[(size_t)i]) idx = i;
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
         if (combo(id.c_str(), idx, o.choices))
         {
             s.randoOptions[o.key] = list[(size_t)idx];
@@ -1358,6 +1317,44 @@ void tab_randomizer(settings::Settings& s, bool& dirty)
         }
         end_card(c);
     }
+    // co-op: players in the room on another randomizer seed, whose world this player can make too
+    if (mp::connected())
+    {
+        std::vector<mp::PlayerInfo> players = mp::room_info();
+        std::vector<const mp::PlayerInfo*> others;
+        for (const mp::PlayerInfo& pl : players)
+            if (!pl.self && !pl.world.empty() && !pl.sameWorld &&
+                std::none_of(others.begin(), others.end(), [&](const mp::PlayerInfo* o) { return o->world == pl.world; }))
+                others.push_back(&pl);
+        bool together = players.size() > 1 && playing &&
+                        std::all_of(players.begin(), players.end(), [](const mp::PlayerInfo& pl) { return pl.sameWorld; });
+        if (!others.empty() || together)
+        {
+            Card c;
+            begin_card(c, "Co-op room");
+            if (together) ImGui::TextWrapped("Everyone in the room plays this seed, so items are shared.");
+            for (const mp::PlayerInfo* pl : others)
+            {
+                rando::World w = rando::parse_world(pl->world);
+                ImGui::PushID(pl->world.c_str());
+                ImGui::TextWrapped("%s plays seed %s.", pl->name.c_str(), w.seed.c_str());
+                ImGui::BeginDisabled(st.running || !rando::generator_available());
+                if (button(std::format("Make {}'s seed", pl->name).c_str()))
+                {
+                    s.randoSeedText = w.seed;
+                    s.randoOptions = w.options;
+                    s.randoEnabled = true;
+                    rando::generate(w.seed, w.options);
+                    dirty = true;
+                }
+                ImGui::EndDisabled();
+                ImGui::PopID();
+            }
+            if (!others.empty())
+                ImGui::TextDisabled("Generates the same world with their seed and options. Restart when it's ready to play it together.");
+            end_card(c);
+        }
+    }
     dirty |= rando_options_card(s, "Where progress items can be", kRandoLocations, 2);
     dirty |= rando_options_card(s, "Items", kRandoItems, 1);
     dirty |= rando_options_card(s, "Entrances", kRandoEntrances, 2);
@@ -1374,7 +1371,7 @@ void tab_enhancements(settings::Settings& s, bool& dirty)
     dirty |= toggle("F12 takes a screenshot", &s.screenshotKey);
     hint("Saved as PNG in your Pictures\\Windfall folder.");
     dirty |= toggle("Discord status", &s.discordPresence);
-    hint("Shows where you are and your co-op room on your Discord profile (applies after restart).");
+    hint("Shows where you are and your co-op room on your Discord profile.");
     section("Graphic packs");
     const auto& packs = gp::packs();
     const gp::Pack* res = gp::resolution_pack();
@@ -1448,7 +1445,8 @@ void tab_enhancements(settings::Settings& s, bool& dirty)
             dirty = true;
         }
         std::string tip = m.description.empty() ? m.folder : m.description;
-        tip += std::string("\n") + (m.hasContent ? "Replaces game content. " : "") + (m.hasPlugin ? "Has a plugin." : "");
+        tip += std::string("\n") + (m.hasContent ? "Replaces game content (from the next area you enter). " : "") +
+               (m.hasPlugin ? "Has a plugin: turning it off pauses it, but changes it already made stay until you restart." : "");
         hint(tip.c_str());
     }
 
@@ -1567,6 +1565,21 @@ void render()
 {
     static bool s_wasOpen = false;
     inject_test_input();
+    // WF_SETTINGS_AT=<frame>:<file>: the settings in that file take over at that presented frame, as if changed in this
+    // menu (tests of settings applied while playing)
+    static const char* s_settingsAt = std::getenv("WF_SETTINGS_AT");  // several: <frame>:<file>;<frame>:<file>
+    for (const char* p = s_settingsAt; p && *p;)
+    {
+        const char* end = std::strchr(p, ';');
+        std::string item(p, end ? end : p + std::strlen(p));
+        if (LatteGPUState.frameCounter == (uint32)std::atoi(item.c_str()))
+        {
+            settings::load_from(item.substr(item.find(':') + 1));
+            settings::apply();
+            log_info("settings: test settings {} applied", item);
+        }
+        p = end ? end + 1 : nullptr;
+    }
     static const uint32 s_openAt = std::getenv("WF_MENU_OPEN") ? (uint32)std::atoi(std::getenv("WF_MENU_OPEN")) : 0;
     if (s_openAt && LatteGPUState.frameCounter == s_openAt)
     {
@@ -1686,6 +1699,8 @@ void render()
         if (ImGui::BeginChild("##page", ImVec2(0, -footer), false, ImGuiWindowFlags_NavFlattened))
         {
             ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
+            static const char* s_scroll = std::getenv("WF_MENU_SCROLL");  // tests: scroll the page down this far on opening
+            if (s_scroll && s_openAt && LatteGPUState.frameCounter == s_openAt + 10) ImGui::SetScrollY((float)std::atof(s_scroll));
             switch (g_tab)
             {
             case 0: tab_graphics(s, dirty); break;
