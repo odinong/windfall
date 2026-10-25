@@ -259,9 +259,10 @@ void wf_record_frame(const std::vector<uint8>& rgb, int width, int height)
     {
         const char* ffmpeg = std::getenv("WF_FFMPEG") ? std::getenv("WF_FFMPEG") : "ffmpeg";
         int fps = std::getenv("WF_FPS") ? std::atoi(std::getenv("WF_FPS")) : 60;
-        std::string cmd = std::format("\"\"{}\" -y -loglevel error -f rawvideo -pix_fmt rgb24 -s {}x{} -r {} -i - -c:v libx264 -preset medium "
+        std::string cmd = std::format("\"\"{}\" -y -loglevel error -f rawvideo -pix_fmt rgb24 -s {}x{} -r {} -i - -c:v libx264 -preset {} "
                                       "-crf 14 -pix_fmt yuv420p \"{}\"\"",
-                                      ffmpeg, width, height, fps, std::getenv("WF_RECORD"));
+                                      ffmpeg, width, height, fps, std::getenv("WF_RECORD_PRESET") ? std::getenv("WF_RECORD_PRESET") : "medium",
+                                      std::getenv("WF_RECORD"));
         g_recordPipe = _popen(cmd.c_str(), "wb");
         if (!g_recordPipe)
         {

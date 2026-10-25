@@ -80,7 +80,9 @@ void create(const char* title)
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD))
         fatal("SDL_Init failed: {}", SDL_GetError());
     State& s = state();
-    s.sdl = SDL_CreateWindow(title, 1280, 720, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    int width = 1280, height = 720;
+    if (const char* e = std::getenv("WF_WINDOW_SIZE")) std::sscanf(e, "%dx%d", &width, &height);  // tests and captures
+    s.sdl = SDL_CreateWindow(title, width, height, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!s.sdl)
         fatal("SDL_CreateWindow failed: {}", SDL_GetError());
     void* hwnd = SDL_GetPointerProperty(SDL_GetWindowProperties(s.sdl), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
