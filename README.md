@@ -1,6 +1,4 @@
-<img width="256" height="256" alt="windfallicon" src="https://github.com/user-attachments/assets/dd91bb8a-1114-4129-b639-8676d139d194" />
-
-# Windfall
+<p align="center"><img src=".github/banner.png" alt="Windfall" width="600"></p>
 
 Windfall is a PC port of The Legend of Zelda: The Wind Waker HD (Wii U, USA). It's a static recompilation: the
 game's PowerPC code gets translated to C++ and compiled into a native Windows program, so there's no emulated CPU at
