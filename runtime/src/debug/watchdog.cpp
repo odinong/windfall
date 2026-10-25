@@ -1,4 +1,5 @@
 #include "debug/watchdog.h"
+#include "debug/profiler.h"
 
 #include <cstdlib>
 #include <functional>
@@ -6,6 +7,7 @@
 #include <chrono>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <map>
 
@@ -97,8 +99,10 @@ LONG CALLBACK watch_handler(EXCEPTION_POINTERS* ep)
         if (write && a >= (uintptr_t)g_base + g_watchAddr && a < (uintptr_t)g_base + g_watchAddr + 4)
         {
             os::Thread* t = thread_for_current_fiber();
-            log_info("watch: write to {:08X} (was {:08X}) by \"{}\"\n{}", g_watchAddr, rd32(g_watchAddr), t ? t->name : "?",
-                     t ? backtrace(t->ctx) : "");
+            static std::atomic<int> s_logged{0};
+            if (s_logged++ < 60)
+                log_info("watch: write to {:08X} (was {:08X}) in guest function {:08X} by \"{}\"\n{}", g_watchAddr, rd32(g_watchAddr),
+                         guest_function_at((uintptr_t)ep->ContextRecord->Rip), t ? t->name : "?", t ? backtrace(t->ctx) : "");
         }
         ep->ContextRecord->EFlags |= 0x100;
         t_rearm = true;

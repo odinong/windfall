@@ -1484,9 +1484,48 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance, 
 	m_state.activePipelineInfo = pipeline_info;
 
 	auto vkObjPipeline = pipeline_info->m_vkrObjPipeline;
+	if (vkObjPipeline->GetPipeline() == VK_NULL_HANDLE && GetConfig().async_compile)
+	{
+		// Windfall: a pipeline still compiling in the background is waited for (the "Wait for new shaders" setting),
+		// so new objects don't appear a few frames late; one that never finishes is given up on
+		static uint32 s_frame = 0;
+		static double s_waitedMs = 0;
+		static std::unordered_map<PipelineInfo*, double> s_pipelineWaitMs;
+		if (s_frame != LatteGPUState.frameCounter)
+		{
+			s_frame = LatteGPUState.frameCounter;
+			s_waitedMs = 0;
+		}
+		double& waited = s_pipelineWaitMs[pipeline_info];
+		auto start = std::chrono::steady_clock::now();
+		double ms = 0;
+		static const char* s_budgetEnv = getenv("WF_PIPELINE_WAIT_MS");
+		const double budgetMs = s_budgetEnv ? atof(s_budgetEnv) : wf_render_settings().waitForShaders ? 1000.0 : 0.0;
+		while (vkObjPipeline->GetPipeline() == VK_NULL_HANDLE && s_waitedMs + ms < budgetMs && waited + ms < 250.0)
+		{
+			std::this_thread::yield();
+			ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+		}
+		s_waitedMs += ms;
+		waited += ms;
+		if (vkObjPipeline->GetPipeline() != VK_NULL_HANDLE)
+			s_pipelineWaitMs.erase(pipeline_info);
+	}
 	if (vkObjPipeline->GetPipeline() == VK_NULL_HANDLE)
 	{
 		// invalid/uninitialized pipeline
+		static const bool s_log = getenv("WF_LOG_SKIPS") != nullptr;
+		static uint32 s_missFrame = 0, s_misses = 0;
+		if (s_log)
+		{
+			if (s_missFrame != LatteGPUState.frameCounter && s_misses)
+			{
+				cemuLog_log(LogType::Force, "frame {}: {} draws without a pipeline", s_missFrame, s_misses);
+				s_misses = 0;
+			}
+			s_missFrame = LatteGPUState.frameCounter;
+			s_misses++;
+		}
 		m_state.activeVertexDS = nullptr;
 		return;
 	}

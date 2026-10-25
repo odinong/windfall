@@ -45,6 +45,14 @@ WF_ORIG(sub_0282685C_orig);
 WF_ORIG(sub_0282167C_orig);
 WF_ORIG(sub_027F2FC4_orig);
 WF_ORIG(sub_025DE37C_orig);
+WF_ORIG(sub_025CBB90_orig);
+WF_ORIG(sub_02524CA0_orig);
+WF_ORIG(sub_02524DA0_orig);
+WF_ORIG(sub_02524EA0_orig);
+WF_ORIG(sub_02524FA0_orig);
+WF_ORIG(sub_025250A0_orig);
+WF_ORIG(sub_0256C8FC_orig);
+WF_ORIG(sub_02518798_orig);
 
 namespace wf::game {
 std::atomic<int> g_testMode{0};
@@ -348,6 +356,44 @@ uint32_t lerp_word(uint32_t prev, uint32_t value)
     float a = std::bit_cast<float>(prev), b = std::bit_cast<float>(value);
     if (!lerpable(a) || !lerpable(b)) return value;
     return std::bit_cast<uint32_t>(a + (b - a) * g_step.load(std::memory_order_relaxed));
+}
+
+// a 3x4 model matrix (host-order float bits, rows of 4) between the previous tick and this one: the translation is
+// lerped, each basis column is lerped and then brought back to its lerped length, so a fast rotation doesn't shrink the
+// model in between; a column that turns nearly all the way round takes the new value
+void lerp_affine(const uint32_t* prev, const uint32_t* cur, uint32_t* out)
+{
+    static const bool plain = std::getenv("WF_60FPS_PLAINLERP") != nullptr;
+    if (plain)
+    {
+        for (int i = 0; i < 12; i++) out[i] = lerp_word(prev[i], cur[i]);
+        return;
+    }
+    const float s = g_step.load(std::memory_order_relaxed);
+    auto f = [](uint32_t w) { return std::bit_cast<float>(w); };
+    for (int r = 0; r < 3; r++) out[r * 4 + 3] = lerp_word(prev[r * 4 + 3], cur[r * 4 + 3]);
+    for (int c = 0; c < 3; c++)
+    {
+        float a[3], b[3], m[3];
+        bool ok = true;
+        for (int r = 0; r < 3; r++)
+        {
+            a[r] = f(prev[r * 4 + c]);
+            b[r] = f(cur[r * 4 + c]);
+            ok &= lerpable(a[r]) && lerpable(b[r]);
+            m[r] = a[r] + (b[r] - a[r]) * s;
+        }
+        float la = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]), lb = std::sqrt(b[0] * b[0] + b[1] * b[1] + b[2] * b[2]);
+        float lm = std::sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+        float dot = la > 0 && lb > 0 ? (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (la * lb) : 1.0f;
+        if (!ok || dot < -0.9f || lm < 1e-6f)
+        {
+            for (int r = 0; r < 3; r++) out[r * 4 + c] = cur[r * 4 + c];
+            continue;
+        }
+        float k = (la + (lb - la) * s) / lm;
+        for (int r = 0; r < 3; r++) out[r * 4 + c] = std::bit_cast<uint32_t>(m[r] * k);
+    }
 }
 
 std::mutex g_cameraLock;
@@ -1045,6 +1091,26 @@ PPC_FUNC(hook_task_calc)
     }
     uint32_t frame = ++game::g_frame;
     game::follow_fps_setting();
+    if (const char* e = std::getenv("WF_60FPS_COUNTERFIND"))
+    {
+        static const uint32_t at = (uint32_t)std::atoi(e);
+        static std::vector<std::vector<uint32_t>> snaps;
+        if (frame >= at && snaps.size() < 6)
+        {
+            snaps.emplace_back(gptr<uint32_t>(0x10000000), gptr<uint32_t>(0x10500000));
+            if (snaps.size() == 6)
+            {
+                std::string out = "counters (+1 every frame for 5 frames):";
+                for (size_t i = 0; i < snaps[0].size(); i++)
+                {
+                    bool inc = true;
+                    for (size_t k = 1; k < snaps.size() && inc; k++) inc = bswap(snaps[k][i]) == bswap(snaps[k - 1][i]) + 1;
+                    if (inc) out += std::format(" {:08X}={}", 0x10000000 + (uint32_t)i * 4, bswap(snaps[5][i]));
+                }
+                log_info("{}", out);
+            }
+        }
+    }
     static const bool lagLog = std::getenv("WF_60FPS_LAGLOG") != nullptr;
     if (lagLog && frame % 30 == 0) log_info("lag: game frame {} gpu frames presented {}", frame, gpu::frame_count());
     const int fps = game::target_fps();
@@ -1227,6 +1293,54 @@ PPC_FUNC(hook_frame_ctrl_update)
     sub_027F2FC4_orig(ctx, base);
 }
 
+PPC_FUNC(hook_tick_vibration)
+{
+    if (game::enabled() && !game::g_logicFrame) return;
+    sub_025CBB90_orig(ctx, base);
+}
+
+PPC_FUNC(hook_tick_magma)
+{
+    if (game::enabled() && !game::g_logicFrame) return;
+    sub_02524CA0_orig(ctx, base);
+}
+
+PPC_FUNC(hook_tick_grass)
+{
+    if (game::enabled() && !game::g_logicFrame) return;
+    sub_02524DA0_orig(ctx, base);
+}
+
+PPC_FUNC(hook_tick_tree)
+{
+    if (game::enabled() && !game::g_logicFrame) return;
+    sub_02524EA0_orig(ctx, base);
+}
+
+PPC_FUNC(hook_tick_wood)
+{
+    if (game::enabled() && !game::g_logicFrame) return;
+    sub_02524FA0_orig(ctx, base);
+}
+
+PPC_FUNC(hook_tick_flower)
+{
+    if (game::enabled() && !game::g_logicFrame) return;
+    sub_025250A0_orig(ctx, base);
+}
+
+PPC_FUNC(hook_tick_poison)
+{
+    if (game::enabled() && !game::g_logicFrame) return;
+    sub_0256C8FC_orig(ctx, base);
+}
+
+PPC_FUNC(hook_tick_collision)
+{
+    if (game::enabled() && !game::g_logicFrame) return;
+    sub_02518798_orig(ctx, base);
+}
+
 PPC_FUNC(hook_draw_handler)
 {
     bool was = game::t_inDraw;
@@ -1265,6 +1379,132 @@ PPC_FUNC(hook_particle_position)
         log_info("particle calc {:08X} on {} frame {}, age {}", particle, game::g_logicFrame ? "logic" : "drawing",
                  (uint32_t)game::g_frame, std::bit_cast<float>(rd32(particle + game::kParticleAge)));
     }
+}
+
+// The HD menus and HUD (the layout code around 02870000) upload their pane matrices with GX2SetVertexUniformReg rather
+// than through the uniform block writer. Each caller and register keeps the list of values written on the last frame of
+// the previous tick; a write is paired with the entry at its position in that list, or a neighbour when a pane appearing
+// or going has shifted the order (it shifts even between the frames of a tick), and blended between ticks like the
+// rest. Values that change within a tick (animated per drawn frame), and moves too large to tell apart from a different
+// pane, are written as they are. Returns false to write the values unchanged.
+bool wf_lerp_uniform_reg(uint32_t lr, uint32_t offset, uint32_t count, const uint32_t* bigEndian, uint32_t* out)
+{
+    using namespace wf;
+    static const bool off = std::getenv("WF_60FPS_NOUIREGS") != nullptr;
+    if (off || !game::enabled() || lr < 0x02870000 || lr >= 0x02880000 || count == 0 || count > 16) return false;
+    using Values = std::array<uint32_t, 16>;
+    struct Site
+    {
+        uint32_t tick = 0, frame = 0, firstFrame = 0, n = 0;
+        std::vector<Values> prev, cur, first;
+        std::vector<bool> used;
+    };
+    static std::mutex lock;
+    static std::unordered_map<uint64_t, Site> sites;
+    static uint32_t pruneTick = 0;
+    const uint32_t frame = game::g_frame, tick = game::g_tick;
+    Values v{};
+    for (uint32_t i = 0; i < count; i++) v[i] = __builtin_bswap32(bigEndian[i]);
+    std::lock_guard lk(lock);
+    if (tick - pruneTick > 30)
+    {
+        pruneTick = tick;
+        std::erase_if(sites, [&](const auto& e) { return tick - e.second.tick > 30; });
+    }
+    Site& s = sites[((uint64_t)lr << 32) | (offset << 8) | count];
+    if (s.tick != tick)
+    {
+        if (s.tick + 1 == tick && s.n == count) s.prev.swap(s.cur);
+        else s.prev.clear();
+        s.cur.clear();
+        s.first.clear();
+        s.tick = tick;
+        s.frame = s.firstFrame = frame;
+        s.n = count;
+        s.used.assign(s.prev.size(), false);
+    }
+    else if (s.frame != frame)
+    {
+        s.frame = frame;
+        s.cur.clear();
+        s.used.assign(s.prev.size(), false);
+    }
+    const size_t k = s.cur.size();
+    s.cur.push_back(v);
+    bool perFrame = false;
+    if (frame == s.firstFrame) s.first.push_back(v);
+    else
+    {
+        perFrame = true;
+        for (long d = -4; d <= 4 && perFrame; d++)
+            if (long j = (long)k + d; j >= 0 && j < (long)s.first.size() && s.first[(size_t)j] == v) perFrame = false;
+    }
+    static uint32_t logFirst = 0, logLast = 0;
+    static bool logInit = false;
+    if (!logInit)
+    {
+        logInit = true;
+        if (const char* e = std::getenv("WF_60FPS_UIREGLOG")) std::sscanf(e, "%u-%u", &logFirst, &logLast);
+    }
+    auto note = [&](const char* what, long j) {
+        if (!logLast || frame < logFirst || frame > logLast) return;
+        std::string vals;
+        for (uint32_t i = 0; i < count; i++)
+            vals += std::format(" {:.4g}/{:.4g}", j >= 0 ? std::bit_cast<float>(s.prev[(size_t)j][i]) : 0.0f, std::bit_cast<float>(v[i]));
+        log_info("ui reg frame {} lr {:08X} off {} n{} #{} {} {}:{}", frame, lr, offset, count, k, what, j, vals);
+    };
+    if (!game::interpolating()) return false;
+    if (perFrame) return note("per-frame", -1), false;
+    if (s.prev.empty()) return note("no-history", -1), false;
+    for (long d = -8; d <= 8; d++)
+        if (long j = (long)k + d; j >= 0 && j < (long)s.prev.size() && !s.used[(size_t)j] && s.prev[(size_t)j] == v)
+        {
+            s.used[(size_t)j] = true;
+            return false;  // unchanged since the last tick
+        }
+    auto distance = [&](const Values& a) {
+        float worst = 0;
+        for (uint32_t i = 0; i < count; i++)
+        {
+            float x = std::bit_cast<float>(a[i]), y = std::bit_cast<float>(v[i]);
+            if (!game::lerpable(x) || !game::lerpable(y)) return -1.0f;
+            float mag = std::max(std::abs(x), std::abs(y));
+            float allowed = 0.15f * mag + (mag > 4.0f ? 16.0f : 0.2f);
+            float d = std::abs(y - x) / allowed;
+            if (d > 1.0f) return -1.0f;
+            worst = std::max(worst, d);
+        }
+        return worst;
+    };
+    long best = -1;
+    float bestDistance = 2.0f, secondDistance = 2.0f;
+    for (long d = -4; d <= 4; d++)
+    {
+        long j = (long)k + d;
+        if (j < 0 || j >= (long)s.prev.size() || s.used[(size_t)j]) continue;
+        float dist = distance(s.prev[(size_t)j]);
+        if (dist < 0) continue;
+        if (dist < bestDistance)
+        {
+            secondDistance = bestDistance;
+            bestDistance = dist;
+            best = j;
+        }
+        else if (dist < secondDistance)
+            secondDistance = dist;
+    }
+    // only a clear match: panes close together moving as a group (the HUD buttons flying in) could pair with each other
+    if (best >= 0 && secondDistance < 2.0f && secondDistance < bestDistance * 4.0f + 0.05f)
+        return note("ambiguous", best), false;
+    if (best >= 0)
+    {
+        s.used[(size_t)best] = true;
+        note("blended", best);
+        for (uint32_t i = 0; i < count; i++) out[i] = __builtin_bswap32(game::lerp_word(s.prev[(size_t)best][i], v[i]));
+        return true;
+    }
+    note("unmatched", k < s.prev.size() ? (long)k : -1);
+    return false;
 }
 
 void wf_pace_swap()
@@ -1340,6 +1580,8 @@ void swap_camera_block(PPCContext& ctx)
 
 void draw_only_frame(PPCContext& ctx)
 {
+    constexpr uint32_t kFrameCounter = 0x101FF560;
+    uint32_t counter = rd32(kFrameCounter);
     swap_camera_block(ctx);
     uint32_t ctxObj = hle::call_guest(ctx, 0x025EE048);
     uint32_t old = 1;
@@ -1347,6 +1589,7 @@ void draw_only_frame(PPCContext& ctx)
     hle::call_guest(ctx, kMtxInit);
     hle::call_guest(ctx, kFpcDwHandler, {kFpcDrawIterater, draw_filter_thunk()});
     if (old != 1) hle::call_guest(ctx, 0x02756170, {rd32(0x101F8B4C), old});
+    wr32(kFrameCounter, counter);
 }
 }
 
@@ -1823,16 +2066,19 @@ PPC_FUNC(hook_skin_palette)
     f.cur.resize(n);
     bool interpolate = game::interpolating() && f.prev.size() == n;
     uint32_t* words = gptr<uint32_t>(dest);
-    for (uint32_t i = 0; i < n; i++)
+    std::copy(words, words + n, f.cur.begin());
+    if (interpolate)
     {
-        uint32_t value = words[i];
-        f.cur[i] = value;
-        if (interpolate)
-            words[i] = game::lerp_word(f.prev[i], value);
+        uint32_t whole = n / 12 * 12;
+        for (uint32_t m = 0; m < whole; m += 12) game::lerp_affine(f.prev.data() + m, f.cur.data() + m, words + m);
+        for (uint32_t i = whole; i < n; i++) words[i] = game::lerp_word(f.prev[i], f.cur[i]);
     }
-    if (frame >= s_logFirst && frame <= s_logLast && s_logLast && n >= 12)
-        log_info("skin out frame {} obj {:08X} index {} interp {} bone0 t=({:.2f},{:.2f},{:.2f})", frame, obj, index, interpolate,
-                 std::bit_cast<float>(words[3]), std::bit_cast<float>(words[7]), std::bit_cast<float>(words[11]));
+    if (frame >= s_logFirst && frame <= s_logLast && s_logLast && n >= 32)
+    {
+        std::string w;
+        for (uint32_t i = 0; i < 32; i++) w += std::format(" {:.3g}", std::bit_cast<float>(words[i]));
+        log_info("skin out frame {} obj {:08X} index {} interp {} words:{}", frame, obj, index, interpolate, w);
+    }
 }
 
 PPC_FUNC(hook_shape_matrix)
@@ -1880,11 +2126,9 @@ PPC_FUNC(hook_shape_matrix)
     float dx = fl(f.cur[3]) - fl(f.prev[3]), dy = fl(f.cur[7]) - fl(f.prev[7]), dz = fl(f.cur[11]) - fl(f.prev[11]);
     if (!(dx * dx + dy * dy + dz * dz < 300.0f * 300.0f))
         return;
-    for (uint32_t i = 0; i < n; i++)
-    {
-        uint32_t v = game::lerp_word(f.prev[i], f.cur[i]);
-        words[i] = swapped ? v : __builtin_bswap32(v);
-    }
+    uint32_t out[n];
+    game::lerp_affine(f.prev.data(), f.cur.data(), out);
+    for (uint32_t i = 0; i < n; i++) words[i] = swapped ? out[i] : __builtin_bswap32(out[i]);
     if (log)
         log_info("shape frame {} {} obj {:08X} slot {} buf {} t {:.1f} {:.1f} {:.1f} (step {:.3f})", frame, game::g_logicFrame ? "logic" : "draw", obj, slot,
                  buffer, fl(game::lerp_word(f.prev[3], f.cur[3])), fl(game::lerp_word(f.prev[7], f.cur[7])), fl(game::lerp_word(f.prev[11], f.cur[11])),

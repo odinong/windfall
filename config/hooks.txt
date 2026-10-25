@@ -14,3 +14,11 @@
 0x0282167C hook_particle_manager_calc wrap  # JPAEmitterManager::calc: particles simulated once per tick
 0x027F2FC4 hook_frame_ctrl_update wrap   # J3DFrameCtrl::update: animations step once per tick
 0x025DE37C hook_draw_handler wrap        # fpcDw_Handler: marks the draw phase (animations stepped there wait for the next tick)
+0x025CBB90 hook_tick_vibration wrap  # run by the play scene draw: once per tick (vibration pattern)
+0x02524CA0 hook_tick_magma wrap      # run by the play scene draw: once per tick (magma)
+0x02524DA0 hook_tick_grass wrap      # run by the play scene draw: once per tick (grass sway)
+0x02524EA0 hook_tick_tree wrap       # run by the play scene draw: once per tick (trees, falling when cut)
+0x02524FA0 hook_tick_wood wrap       # run by the play scene draw: once per tick (wood)
+0x025250A0 hook_tick_flower wrap     # run by the play scene draw: once per tick (flowers)
+0x0256C8FC hook_tick_poison wrap     # run by the play scene draw: once per tick (poison light collision)
+0x02518798 hook_tick_collision wrap  # run by the play scene draw: once per tick (collision checks)

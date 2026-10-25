@@ -11,5 +11,7 @@ bool driving();
 void apply(input::ProState& s, bool& fastForward);
 
 void tick();
+// the presented frame when the playtest reached its spawn point (0 until then)
+uint32_t arrival_frame();
 
 }

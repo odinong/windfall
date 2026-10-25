@@ -19,7 +19,11 @@ bool cemu_log_all()
 }
 void cemu_fatal(const char* what) { fatal("{}", what); }
 
-const fs::path& user_data_dir() { return config().dataDir; }
+const fs::path& user_data_dir()
+{
+    static const fs::path dir = std::getenv("WF_CACHE_DIR") ? fs::path(std::getenv("WF_CACHE_DIR")) : config().dataDir;
+    return dir;
+}
 
 }
 

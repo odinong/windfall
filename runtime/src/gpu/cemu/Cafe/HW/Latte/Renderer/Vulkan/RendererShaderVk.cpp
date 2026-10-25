@@ -133,7 +133,7 @@ public:
 		if (m_threadsActive.exchange(true))
 			return;
 		// create thread pool
-		const uint32 threadCount = 2;
+		const uint32 threadCount = std::clamp<uint32>(GetPhysicalCoreCount() > 2 ? GetPhysicalCoreCount() - 2 : 2, 2, 6); // Windfall: more than Cemu's 2, so new shaders are ready sooner
 		for (uint32 i = 0; i < threadCount; ++i)
 			s_threads.emplace_back(&_ShaderVkThreadPool::CompilerThreadFunc, this);
 	}

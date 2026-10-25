@@ -21,6 +21,14 @@ PPC_FUNC(hook_shape_matrix);
 PPC_FUNC(hook_particle_manager_calc);
 PPC_FUNC(hook_frame_ctrl_update);
 PPC_FUNC(hook_draw_handler);
+PPC_FUNC(hook_tick_vibration);
+PPC_FUNC(hook_tick_magma);
+PPC_FUNC(hook_tick_grass);
+PPC_FUNC(hook_tick_tree);
+PPC_FUNC(hook_tick_wood);
+PPC_FUNC(hook_tick_flower);
+PPC_FUNC(hook_tick_poison);
+PPC_FUNC(hook_tick_collision);
 
 namespace wf {
 
@@ -46,6 +54,14 @@ const NamedFunc kHooks[] = {
     {"hook_particle_manager_calc", hook_particle_manager_calc},
     {"hook_frame_ctrl_update", hook_frame_ctrl_update},
     {"hook_draw_handler", hook_draw_handler},
+    {"hook_tick_vibration", hook_tick_vibration},
+    {"hook_tick_magma", hook_tick_magma},
+    {"hook_tick_grass", hook_tick_grass},
+    {"hook_tick_tree", hook_tick_tree},
+    {"hook_tick_wood", hook_tick_wood},
+    {"hook_tick_flower", hook_tick_flower},
+    {"hook_tick_poison", hook_tick_poison},
+    {"hook_tick_collision", hook_tick_collision},
     {nullptr, nullptr},
 };
 

@@ -8,6 +8,8 @@
 #include "Cafe/HW/Latte/ISA/LatteReg.h"
 #include "Cafe/HW/Latte/ISA/LatteInstructions.h"
 
+bool wf_lerp_uniform_reg(uint32 lr, uint32 offset, uint32 count, const uint32* bigEndian, uint32* out);
+
 namespace GX2
 {
 	using namespace Latte;
@@ -457,6 +459,12 @@ namespace GX2
 
 	void GX2SetVertexUniformReg(uint32 offset, uint32 sizeInU32s, uint32be* values)
 	{
+		uint32be blended[16];
+		if (sizeInU32s <= 16 && wf_lerp_uniform_reg(PPCInterpreter_getCurrentInstance()->spr.LR, offset, sizeInU32s, (const uint32*)values, (uint32*)blended))
+		{
+			_GX2SubmitUniformReg(0x400, offset, blended, sizeInU32s);
+			return;
+		}
 		_GX2SubmitUniformReg(0x400, offset, values, sizeInU32s);
 	}
 

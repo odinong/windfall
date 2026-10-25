@@ -48,6 +48,18 @@ uint32_t guest_for(uintptr_t rip)
     return it->guest;
 }
 
+std::once_flag g_rangesOnce;
+
+}  // namespace
+
+uint32_t guest_function_at(uintptr_t hostAddress)
+{
+    std::call_once(g_rangesOnce, build_ranges);
+    return guest_for(hostAddress);
+}
+
+namespace {
+
 uint32_t guest_func_of(uint32_t addr)
 {
     auto it = std::upper_bound(g_guestStarts.begin(), g_guestStarts.end(), addr);
@@ -219,7 +231,7 @@ void sampler()
 void profiler_start()
 {
     if (!std::getenv("WF_PROFILE")) return;
-    build_ranges();
+    std::call_once(g_rangesOnce, build_ranges);
     std::thread(sampler).detach();
 }
 

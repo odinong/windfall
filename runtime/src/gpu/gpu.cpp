@@ -12,6 +12,7 @@
 #include "core/guest.h"
 #include "core/log.h"
 #include "gpu/gpu.h"
+#include "enhancements/playtest.h"
 
 void Latte_Start();
 namespace wf::game { extern std::atomic<int> g_testMode; }
@@ -38,16 +39,24 @@ void start_screenshot_hook()
         }).detach();
     }
     const char* list = std::getenv("WF_SHOT");
-    if (!list) return;
+    const char* afterArrival = std::getenv("WF_SHOT_ARRIVAL");  // a-b: every frame from a to b after the playtest arrives
+    if (!list && !afterArrival) return;
     std::vector<uint32> frames;
-    for (const char* p = list; *p;)
+    for (const char* p = list ? list : ""; *p;)
     {
         frames.push_back((uint32)std::strtoul(p, (char**)&p, 10));
         while (*p == ',' || *p == ' ') p++;
     }
     std::sort(frames.begin(), frames.end());
     std::string dir = std::getenv("WF_SHOT_DIR") ? std::getenv("WF_SHOT_DIR") : ".";
-    std::thread([frames, dir] {
+    std::thread([frames, dir, afterArrival]() mutable {
+        if (afterArrival)
+        {
+            uint32 a = 0, b = 0;
+            std::sscanf(afterArrival, "%u-%u", &a, &b);
+            while (!playtest::arrival_frame()) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            for (uint32 f = a; f <= b; f++) frames.push_back(playtest::arrival_frame() + f);
+        }
         for (uint32 target : frames)
         {
             while (LatteGPUState.frameCounter < target)

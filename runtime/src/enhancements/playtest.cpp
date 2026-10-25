@@ -21,6 +21,7 @@ constexpr uint16_t kOutsetDockPoint = 0;
 enum Phase : int { kMenus, kPrologue, kWarp, kArriving, kDone };
 std::atomic<bool> g_enabled{false};
 std::atomic<int> g_phase{kMenus};
+std::atomic<uint32_t> g_arrivalFrame{0};
 uint32_t g_arrivedTicks = 0;
 
 std::string stage_name(uint32_t addr)
@@ -94,6 +95,7 @@ void debug_player(bool arriving)
 bool enabled() { return g_enabled || std::getenv("WF_PLAYTEST"); }
 void set_enabled() { g_enabled = true; }
 bool driving() { return enabled() && g_phase != kDone; }
+uint32_t arrival_frame() { return g_arrivalFrame; }
 
 void apply(input::ProState& s, bool& fastForward)
 {
@@ -141,7 +143,8 @@ void tick()
     case kArriving:
         if (start == "sea" && rd16(kStartStage + 8) == spawn_point() && rd8(kStartStage + 10) == kOutsetRoom && !rd8(kNextEnable))
         {
-            if (++g_arrivedTicks >= 45) set_phase(kDone, "ready on Outset Island - have fun");
+            if (++g_arrivedTicks == 1) g_arrivalFrame = gpu::frame_count();
+            if (g_arrivedTicks >= 45) set_phase(kDone, "ready on Outset Island - have fun");
         }
         else
             g_arrivedTicks = 0;

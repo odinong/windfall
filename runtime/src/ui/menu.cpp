@@ -661,6 +661,9 @@ void tab_graphics(settings::Settings& s, bool& dirty)
     ImGui::EndDisabled();
     hint("The game's renderer draws to its own buffers, so hardware MSAA can't be applied. Use a higher internal resolution or FXAA.");
     dirty |= toggle("FXAA", &s.fxaa);
+    dirty |= toggle("Wait for new shaders", &s.waitForShaders);
+    hint("The first time something is drawn, its shaders are built for your GPU. On: the game pauses briefly until they're ready, "
+         "so nothing pops in. Off: no pauses, but new objects can appear a moment late. Either way it only happens once.");
     dirty |= slider_int("Sharpening", &s.sharpening, 0, 100, s.sharpening ? "%d%%" : "Off");
     section("Textures");
     int aniso = s.anisotropy == 0 ? 0 : s.anisotropy <= 2 ? 1 : s.anisotropy <= 4 ? 2 : s.anisotropy <= 8 ? 3 : 4;

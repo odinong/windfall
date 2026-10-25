@@ -15,6 +15,7 @@ struct WFRenderSettings
     std::atomic<uint32_t> samplerGeneration{0};
     std::atomic<float> fovScale{1.0f};
     std::atomic<bool> pauseInBackground{false};
+    std::atomic<bool> waitForShaders{true};
 };
 
 WFRenderSettings& wf_render_settings();
