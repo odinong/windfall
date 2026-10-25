@@ -35,6 +35,7 @@ enum FrameRate : int { kFps30, kFps60 };
 struct Settings
 {
     bool fxaa = false;
+    bool smoothUi = false;  // experimental: menus and HUD blended between ticks at high frame rates
     bool waitForShaders = true;  // draw new objects only once their shaders are built (a pause) rather than late (pop-in)
     int sharpening = 0;
     int anisotropy = 0;

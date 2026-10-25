@@ -367,8 +367,9 @@ uint32_t lerp_word(uint32_t prev, uint32_t value)
 }
 
 // a 3x4 model matrix (host-order float bits, rows of 4) between the previous tick and this one: the translation is
-// lerped, each basis column is lerped and then brought back to its lerped length, so a fast rotation doesn't shrink the
-// model in between; a column that turns nearly all the way round takes the new value
+// lerped, the rotation is slerped (as a quaternion) and each axis' scale lerped, so a part turning fast keeps its shape
+// in between. A part that turned more than ~100 degrees in one tick (a flip, like Link's hat when his head goes
+// upside down in a roll) takes the new matrix: there is no sensible halfway, and blending it sheared the mesh.
 void lerp_affine(const uint32_t* prev, const uint32_t* cur, uint32_t* out)
 {
     static const bool plain = std::getenv("WF_60FPS_PLAINLERP") != nullptr;
@@ -379,29 +380,107 @@ void lerp_affine(const uint32_t* prev, const uint32_t* cur, uint32_t* out)
     }
     const float s = g_step.load(std::memory_order_relaxed);
     auto f = [](uint32_t w) { return std::bit_cast<float>(w); };
-    for (int r = 0; r < 3; r++) out[r * 4 + 3] = lerp_word(prev[r * 4 + 3], cur[r * 4 + 3]);
+    auto take_cur = [&] { std::copy(cur, cur + 12, out); };
+    // columns, their lengths (scale) and the rotation with the scale taken out
+    double ra[3][3], rb[3][3], sa[3], sb[3];
     for (int c = 0; c < 3; c++)
     {
-        float a[3], b[3], m[3];
-        bool ok = true;
+        double la = 0, lb = 0;
         for (int r = 0; r < 3; r++)
         {
-            a[r] = f(prev[r * 4 + c]);
-            b[r] = f(cur[r * 4 + c]);
-            ok &= lerpable(a[r]) && lerpable(b[r]);
-            m[r] = a[r] + (b[r] - a[r]) * s;
+            float x = f(prev[r * 4 + c]), y = f(cur[r * 4 + c]);
+            if (!lerpable(x) || !lerpable(y)) return take_cur();
+            ra[r][c] = x;
+            rb[r][c] = y;
+            la += (double)x * x;
+            lb += (double)y * y;
         }
-        float la = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]), lb = std::sqrt(b[0] * b[0] + b[1] * b[1] + b[2] * b[2]);
-        float lm = std::sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
-        float dot = la > 0 && lb > 0 ? (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (la * lb) : 1.0f;
-        if (!ok || dot < -0.9f || lm < 1e-6f)
+        sa[c] = std::sqrt(la);
+        sb[c] = std::sqrt(lb);
+        if (sa[c] < 1e-9 || sb[c] < 1e-9) return take_cur();
+        for (int r = 0; r < 3; r++)
         {
-            for (int r = 0; r < 3; r++) out[r * 4 + c] = cur[r * 4 + c];
-            continue;
+            ra[r][c] /= sa[c];
+            rb[r][c] /= sb[c];
         }
-        float k = (la + (lb - la) * s) / lm;
-        for (int r = 0; r < 3; r++) out[r * 4 + c] = std::bit_cast<uint32_t>(m[r] * k);
     }
+    // to quaternions (w, x, y, z); a mirrored matrix (determinant < 0) can't be one: blend it as before
+    auto det = [](const double m[3][3]) {
+        return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+               m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    };
+    auto to_quat = [](const double m[3][3], double q[4]) {
+        double t = m[0][0] + m[1][1] + m[2][2];
+        if (t > 0)
+        {
+            double k = 0.5 / std::sqrt(t + 1.0);
+            q[0] = 0.25 / k;
+            q[1] = (m[2][1] - m[1][2]) * k;
+            q[2] = (m[0][2] - m[2][0]) * k;
+            q[3] = (m[1][0] - m[0][1]) * k;
+        }
+        else if (m[0][0] > m[1][1] && m[0][0] > m[2][2])
+        {
+            double k = 2.0 * std::sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]);
+            q[0] = (m[2][1] - m[1][2]) / k;
+            q[1] = 0.25 * k;
+            q[2] = (m[0][1] + m[1][0]) / k;
+            q[3] = (m[0][2] + m[2][0]) / k;
+        }
+        else if (m[1][1] > m[2][2])
+        {
+            double k = 2.0 * std::sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]);
+            q[0] = (m[0][2] - m[2][0]) / k;
+            q[1] = (m[0][1] + m[1][0]) / k;
+            q[2] = 0.25 * k;
+            q[3] = (m[1][2] + m[2][1]) / k;
+        }
+        else
+        {
+            double k = 2.0 * std::sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]);
+            q[0] = (m[1][0] - m[0][1]) / k;
+            q[1] = (m[0][2] + m[2][0]) / k;
+            q[2] = (m[1][2] + m[2][1]) / k;
+            q[3] = 0.25 * k;
+        }
+        double n = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+        for (int i = 0; i < 4; i++) q[i] /= n;
+    };
+    if (det(ra) <= 0 || det(rb) <= 0)
+    {
+        for (int i = 0; i < 12; i++) out[i] = lerp_word(prev[i], cur[i]);
+        return;
+    }
+    double qa[4], qb[4];
+    to_quat(ra, qa);
+    to_quat(rb, qb);
+    double dot = qa[0] * qb[0] + qa[1] * qb[1] + qa[2] * qb[2] + qa[3] * qb[3];
+    if (dot < 0)
+    {
+        dot = -dot;
+        for (double& v : qb) v = -v;
+    }
+    if (dot < 0.64) return take_cur();  // turned more than ~100 degrees in one tick
+    double q[4];
+    double theta = std::acos(std::min(1.0, dot));
+    if (theta < 1e-4)
+        for (int i = 0; i < 4; i++) q[i] = qa[i] + (qb[i] - qa[i]) * s;
+    else
+    {
+        double wa = std::sin((1 - s) * theta) / std::sin(theta), wb = std::sin(s * theta) / std::sin(theta);
+        for (int i = 0; i < 4; i++) q[i] = qa[i] * wa + qb[i] * wb;
+    }
+    double n = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    double w = q[0] / n, x = q[1] / n, y = q[2] / n, z = q[3] / n;
+    const double m[3][3] = {{1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)},
+                            {2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)},
+                            {2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)}};
+    for (int c = 0; c < 3; c++)
+    {
+        double sc = sa[c] + (sb[c] - sa[c]) * s;
+        for (int r = 0; r < 3; r++) out[r * 4 + c] = std::bit_cast<uint32_t>((float)(m[r][c] * sc));
+    }
+    for (int r = 0; r < 3; r++) out[r * 4 + 3] = lerp_word(prev[r * 4 + 3], cur[r * 4 + 3]);
 }
 
 std::mutex g_cameraLock;
@@ -1431,7 +1510,7 @@ bool wf_lerp_uniform_reg(uint32_t lr, uint32_t offset, uint32_t count, const uin
 {
     using namespace wf;
     static const bool off = std::getenv("WF_60FPS_NOUIREGS") != nullptr;
-    if (off || !game::enabled() || lr < 0x02870000 || lr >= 0x02880000 || count == 0 || count > 16) return false;
+    if (off || !wf_render_settings().smoothUi || !game::enabled() || lr < 0x02870000 || lr >= 0x02880000 || count == 0 || count > 16) return false;
     using Values = std::array<uint32_t, 16>;
     struct Site
     {
@@ -2144,6 +2223,17 @@ PPC_FUNC(hook_shape_matrix)
         if (f.cur.size() == n && f.tick + 1 == tick) f.prev.swap(f.cur);
         else f.prev.clear();
         f.tick = tick;
+    }
+    static const bool multiLog = std::getenv("WF_60FPS_MULTIWRITE") != nullptr;  // test: one part written twice in a frame
+    if (multiLog && f.frame == frame && f.cur.size() == n)
+    {
+        uint32_t* w = gptr<uint32_t>(dest);
+        bool differs = false;
+        for (uint32_t i = 0; i < n; i++) differs |= f.cur[i] != (swapped ? w[i] : __builtin_bswap32(w[i]));
+        static std::atomic<int> s_count{0};
+        if (s_count++ < 40)
+            log_info("shape written again in frame {}: obj {:08X} slot {} buf {} dest {:08X} {} lr {:08X}", frame, obj, slot, buffer, dest,
+                     differs ? "DIFFERENT" : "same", ctx.lr);
     }
     f.frame = frame;
     f.cur.resize(n);

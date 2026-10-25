@@ -64,9 +64,9 @@ float pad_value(SDL_Gamepad* pad, int code, float deadzone)
 }
 
 struct ScriptStep { uint32_t start, end; uint32_t buttons; float lx, ly, rx, ry; bool fastForward = false; };
-std::vector<ScriptStep> g_script;
+std::vector<ScriptStep> g_script, g_preScript;  // g_preScript: WF_INPUT_PRE, counted from launch
 
-void parse_script(const char* s)
+void parse_script(const char* s, std::vector<ScriptStep>& g_script)
 {
     static constexpr std::pair<std::string_view, uint32_t> kNames[] = {
         {"A", kA}, {"B", kB}, {"X", kX}, {"Y", kY}, {"L", kL}, {"R", kR}, {"ZL", kZL}, {"ZR", kZR},
@@ -123,7 +123,9 @@ void parse_script(const char* s)
 void init()
 {
     if (const char* s = std::getenv("WF_INPUT"))
-        parse_script(s);
+        parse_script(s, g_script);
+    if (const char* s = std::getenv("WF_INPUT_PRE"))
+        parse_script(s, g_preScript);
 }
 
 void handle_event(const SDL_Event& e)
@@ -185,6 +187,16 @@ void update()
     if (std::getenv("WF_FAST_FORWARD")) g_fastForward = true;
     if (ui::menu::is_open())
         s = ProState{};
+    for (const ScriptStep& step : g_preScript)
+    {
+        uint32_t frame = gpu::frame_count();
+        if (frame < step.start || frame >= step.end) continue;
+        s.buttons |= step.buttons;
+        if (step.lx) s.lx = step.lx;
+        if (step.ly) s.ly = step.ly;
+        if (step.rx) s.rx = step.rx;
+        if (step.ry) s.ry = step.ry;
+    }
     static const bool fromArrival = std::getenv("WF_INPUT_ARRIVAL") != nullptr;  // script frames count from the playtest's arrival
     if (!g_script.empty() && (!fromArrival || playtest::arrival_frame()))
     {

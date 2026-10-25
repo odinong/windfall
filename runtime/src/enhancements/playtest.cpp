@@ -120,6 +120,14 @@ void apply(input::ProState& s, bool& fastForward)
 void tick()
 {
     debug_player(driving());
+    // a normal launch: "arrival" is when the player has been in a stage for 2 seconds (scripted test input counts from it)
+    if (!enabled() && !g_arrivalFrame)
+    {
+        static uint32_t s_ticks = 0;
+        std::string st = stage_name(kStartStage);
+        s_ticks = rd32(0x1047428C) && !st.empty() && st != "Name" && !st.starts_with("sea_T") ? s_ticks + 1 : 0;
+        if (s_ticks == 60) g_arrivalFrame = gpu::frame_count();
+    }
     if (!driving()) return;
     std::string start = stage_name(kStartStage), next = stage_name(kNextStage);
     switch (g_phase.load())

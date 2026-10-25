@@ -704,6 +704,9 @@ void tab_video(settings::Settings& s, bool& dirty)
         hint("The game's logic stays at 30 ticks per second (so it plays the same); every frame in between is "
              "interpolated. Pick your monitor's refresh rate with V-Sync on.");
     }
+    dirty |= toggle("Smooth menus and HUD (experimental)", &s.smoothUi);
+    hint("Animates menus and the HUD at your full frame rate instead of the game's 30. Some HUD pieces can briefly "
+         "jump or overlap at very high frame rates.");
     dirty |= slider_int("Field of view", &s.fieldOfView, 40, 100, s.fieldOfView == 60 ? "60 (original)" : "%d");
     hint("The camera's vertical angle of view in degrees. Wider shows more around Link; the game's own is 60.");
     section("Color");

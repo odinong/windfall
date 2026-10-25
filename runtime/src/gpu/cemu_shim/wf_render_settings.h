@@ -16,6 +16,7 @@ struct WFRenderSettings
     std::atomic<float> fovScale{1.0f};
     std::atomic<bool> pauseInBackground{false};
     std::atomic<bool> waitForShaders{true};
+    std::atomic<bool> smoothUi{false};
 };
 
 WFRenderSettings& wf_render_settings();

@@ -96,6 +96,7 @@ void for_each_value(Settings& s, F&& f)
 {
     f("graphics.fxaa", s.fxaa);
     f("graphics.wait_for_shaders", s.waitForShaders);
+    f("video.smooth_ui", s.smoothUi);
     f("graphics.sharpening", s.sharpening);
     f("graphics.anisotropy", s.anisotropy);
     f("graphics.texture_filter", s.textureFilter);
@@ -355,6 +356,7 @@ void apply()
     WFRenderSettings& r = wf_render_settings();
     r.fxaa = s.fxaa ? 1.0f : 0.0f;
     r.waitForShaders = s.waitForShaders;
+    r.smoothUi = s.smoothUi;
     r.sharpen = s.sharpening / 100.0f;
     r.brightness = s.brightness;
     r.contrast = s.contrast;
