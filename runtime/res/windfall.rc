@@ -1,0 +1,2 @@
+// Windows resources: the program icon (resource 1, which Explorer, the taskbar and SDL's window class use)
+1 ICON "windfall.ico"

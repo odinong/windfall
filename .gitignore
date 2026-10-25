@@ -1,0 +1,27 @@
+/build/
+/out/
+/dist/
+
+/generated/
+
+# Anything extracted from or derived from the user's game image
+/game/
+/extracted/
+/shadercache/
+
+/.local/
+
+__pycache__/
+*.pyc
+.venv/
+
+.vs/
+.vscode/
+*.user
+windfall.log
+
+windfall_game.*
+
+/tools/discord_*.py
+/tools/notify.py
+/tools/record.py

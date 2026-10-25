@@ -1,0 +1,35 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No game data in the repository
+        shell: pwsh
+        run: python tools/guard/check_no_game_data.py --dir .
+
+      - name: Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: 1.4.309.0
+          install_runtime: false
+          cache: true
+
+      - name: Build windfall.exe
+        shell: pwsh
+        run: scripts/build.ps1 -Preset release
+
+      - name: Recompiler build id
+        shell: pwsh
+        run: python tools/recomp/recomp.py --build-id
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windfall-exe
+          path: build/release/runtime/windfall.exe

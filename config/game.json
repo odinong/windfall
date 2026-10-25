@@ -1,0 +1,11 @@
+{
+  "title": "The Legend of Zelda: The Wind Waker HD",
+  "title_id": "0005000010143500",
+  "product_code": "WUP-P-BCZE",
+  "region": "USA",
+  "title_version": 0,
+  "executable": "code/cking.rpx",
+  "sha1": {
+    "code/cking.rpx": "bdcbc4f815ae4c9b0a1f4a16238f96c197b38239"
+  }
+}

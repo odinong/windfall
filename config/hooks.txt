@@ -1,0 +1,16 @@
+# Guest functions replaced by host implementations (high-level emulation).
+# Format: <guest address> <host function name> [wrap]   e.g.  0x028F0314  hook_abort
+# The recompiler routes every direct and indirect call to the named PPC_FUNC, which the runtime
+# must define. The guest body is skipped, or with "wrap" kept as sub_<address>_orig so the hook can
+# call the original. Calls to system-library imports are handled
+# separately (runtime/src/hle) and do not belong here.
+0x02746790 hook_task_calc wrap      # framework task-tree calc (all game systems): 60 fps tick split
+0x027BF048 hook_ubo_write wrap      # uniform-block field writer: matrix interpolation
+0x02747BDC hook_task_node wrap      # task-tree node calc: per-task 60 fps policy
+0x027DBC2C hook_skin_palette wrap   # J3D envelope skinning: matrix palette interpolation
+0x0274C874 hook_wait_vsync wrap     # framework vsync wait: frame timing statistics
+0x0282685C hook_particle_position wrap #  JPABaseParticle::calcPosition: particle interpolation
+0x027DDBB0 hook_shape_matrix wrap   # J3D rigid shape world matrix: matrix interpolation
+0x0282167C hook_particle_manager_calc wrap  # JPAEmitterManager::calc: particles simulated once per tick
+0x027F2FC4 hook_frame_ctrl_update wrap   # J3DFrameCtrl::update: animations step once per tick
+0x025DE37C hook_draw_handler wrap        # fpcDw_Handler: marks the draw phase (animations stepped there wait for the next tick)

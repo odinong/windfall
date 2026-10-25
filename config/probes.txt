@@ -1,0 +1,3 @@
+# Debug logpoints: <guest address> <label>. The recompiler inserts wf::probe() before the
+# instruction at each address, which logs registers and a guest backtrace (log category "probe").
+# Keep this list short; remove entries once the investigation is done.
