@@ -1,4 +1,4 @@
-<img width="512" height="512" alt="windfallicon" src="https://github.com/user-attachments/assets/dd91bb8a-1114-4129-b639-8676d139d194" />
+<img width="256" height="256" alt="windfallicon" src="https://github.com/user-attachments/assets/dd91bb8a-1114-4129-b639-8676d139d194" />
 
 # Windfall
 
