@@ -120,6 +120,10 @@ constexpr uint32_t kMaxLife = kSave + 0x00, kLife = kSave + 0x02;
 constexpr uint32_t kEvents = kSave + 0x624, kStageMemory = kSave + 0x380, kOcean = kSave + 0x5C0;
 constexpr uint32_t kCharts = kSave + 0xC4;  // treasure/Triforce charts owned, deciphered, salvaged; sea map sectors
 constexpr uint32_t kLiveMemory = kSave + 0x778, kStageNo = kSave + 0x79C;
+// temporary switches: the dungeon's (cleared when it's left) and each loaded room's (a zone: room number, 10 bytes of
+// switch/item bits, then actor flags; cleared when the room unloads)
+constexpr uint32_t kDanSwitches = kSave + 0x7A0, kZones = kSave + 0x7A8;
+constexpr int kDanBytes = 8, kZoneSize = 0x4C, kZoneCount = 32, kZoneBits = 2, kZoneBitBytes = 10;
 constexpr uint32_t kNextStage = 0x104741F0, kNextEnable = 0x104741FC;
 constexpr int kItemSlotCount = 21, kFirstBottle = 14, kBottles = 4, kCollectCount = 5;
 constexpr uint8_t kEmptyBottle = 0x50;
@@ -292,6 +296,7 @@ constexpr int kStoryMemory = kEventBytes, kStoryOcean = kStoryMemory + kMemBytes
 constexpr int kStoryBytes = kStoryCharts + kChartBytes;
 constexpr uint8_t kEventStory = 4;   // payload: the host's story bytes, every few seconds
 constexpr uint8_t kEventChange = 5;  // payload: {u16 offset, u8 set, u8 clear}... (offsets into the story bytes)
+constexpr uint8_t kEventLocal = 6;   // payload: stage[8], {u8 area (0 dungeon, 1 room), s8 room, u8 offset, u8 set, u8 clear}...
 constexpr double kChangeResend = 2.0;
 
 struct StoryChange { uint16_t offset; uint8_t set, clear; };
@@ -299,7 +304,21 @@ struct Churn { double since = 0; uint8_t count[8] = {}; uint8_t muted = 0; };  /
 std::array<uint8_t, kStoryBytes> g_storyShadow{};
 std::array<Churn, kStoryBytes> g_churn{};
 std::array<std::pair<uint8_t, double>, kStoryBytes> g_recent{};  // bits changed here lately and when, resent a while
-std::optional<std::vector<uint8_t>> g_storySnapIn;
+struct StorySnap { int from; uint8_t epoch; std::vector<uint8_t> bytes; };
+std::optional<StorySnap> g_storySnapIn;
+int g_storyFrom = -1, g_storyEpochSeen = -1;  // whose story this game took on, and which of their loads
+uint8_t g_storyEpoch = 0;                       // bumped when this game (as host) loads a file again
+// temporary switches, shared with whoever is in the same stage (and room)
+struct LocalChange { uint8_t area; int8_t room; uint8_t offset, set, clear; };
+struct ZoneShadow { int room = -1, age = 0; uint8_t bits[kZoneBitBytes] = {}; };
+char g_localStage[8] = {};
+bool g_danValid = false;
+uint8_t g_danShadow[kDanBytes] = {};
+ZoneShadow g_zoneShadow[kZoneCount];
+std::map<uint32_t, std::pair<uint8_t, double>> g_localRecent;
+std::map<uint32_t, Churn> g_localChurn;
+std::vector<std::pair<std::array<char, 8>, LocalChange>> g_localIn;
+double g_localSent = 0;
 std::vector<StoryChange> g_changesIn;
 std::vector<std::vector<uint8_t>> g_storyOut;  // event kind + payload
 bool g_storyBaseline = false, g_storyAdopted = false;
@@ -339,6 +358,11 @@ void reset_story()
     g_storyOut.clear();
     g_churn = {};
     g_recent = {};
+    g_storyFrom = g_storyEpochSeen = -1;
+    std::memset(g_localStage, 0, sizeof g_localStage);
+    g_localRecent.clear();
+    g_localChurn.clear();
+    g_localIn.clear();
 }
 
 
@@ -472,8 +496,14 @@ void handle(const uint8_t* d, int n)
                 memcpy(&inv, d + 7, sizeof inv);
                 g_invIn.push_back(inv);
             }
-            else if (d[6] == kEventStory && n == 7 + kStoryBytes && d[1] == story_host() && !g_storyAdopted)
-                g_storySnapIn.emplace(d + 7, d + n);
+            else if (d[6] == kEventStory && n == 8 + kStoryBytes && d[1] == story_host())
+                g_storySnapIn = StorySnap{d[1], d[7], std::vector<uint8_t>(d + 8, d + n)};
+            else if (d[6] == kEventLocal && n >= 15 && it != g_remotes.end() && it->second.world == rando::playing_world())
+            {
+                std::array<char, 8> stage;
+                std::memcpy(stage.data(), d + 7, 8);
+                for (int i = 15; i + 5 <= n; i += 5) g_localIn.push_back({stage, {d[i], (int8_t)d[i + 1], d[i + 2], d[i + 3], d[i + 4]}});
+            }
             else if (d[6] == kEventChange && it != g_remotes.end() && it->second.world == rando::playing_world())
                 for (int i = 7; i + 4 <= n; i += 4) g_changesIn.push_back({(uint16_t)(d[i] | d[i + 1] << 8), d[i + 2], d[i + 3]});
         }
@@ -1079,12 +1109,131 @@ bool share_story()
     return settings::get().mpShareStory;
 }
 
+// counts a byte's changed bits; a bit that changes more than 8 times in 20 s stops being shared. Returns the rest
+uint8_t unmuted(Churn& c, uint8_t bits, double t, const std::string& what)
+{
+    if (t - c.since > 20.0)
+    {
+        c.since = t;
+        std::fill(std::begin(c.count), std::end(c.count), 0);
+    }
+    for (int b = 0; b < 8; b++)
+        if ((bits >> b & 1) && !(c.muted >> b & 1) && ++c.count[b] > 8)
+        {
+            c.muted |= (uint8_t)(1 << b);
+            log_info("mp: {} bit {} keeps changing, no longer shared", what, b);
+        }
+    return bits & ~c.muted;
+}
+
+uint32_t local_key(int area, int room, int offset) { return (uint32_t)area << 16 | (uint32_t)(uint8_t)room << 8 | (uint32_t)offset; }
+
+// the zone holding a loaded room, 0 if it isn't loaded
+uint32_t zone_of(int room)
+{
+    for (int k = 0; k < kZoneCount; k++)
+        if ((int8_t)rd8(kZones + k * kZoneSize) == room) return kZones + k * kZoneSize;
+    return 0;
+}
+
+uint32_t local_addr(int area, int room, int offset)
+{
+    if (area == 0) return offset < kDanBytes ? kDanSwitches + offset : 0;
+    uint32_t z = offset < kZoneBitBytes ? zone_of(room) : 0;
+    return z ? z + kZoneBits + offset : 0;
+}
+
+// temporary switches: changes go to whoever is in the same stage, applied to the same room's zone
+void sync_local(double t)
+{
+    char stage[8];
+    for (int i = 0; i < 8; i++) stage[i] = (char)rd8(kStartStage + i);
+    if (std::memcmp(stage, g_localStage, 8) != 0)
+    {
+        std::memcpy(g_localStage, stage, 8);
+        g_danValid = false;
+        for (ZoneShadow& z : g_zoneShadow) z = {};
+        g_localRecent.clear();
+    }
+    bool changed = false;
+    auto local_change = [&](int area, int room, int offset, uint8_t before, uint8_t after) {
+        uint32_t key = local_key(area, room, offset);
+        uint8_t bits = unmuted(g_localChurn[key], before ^ after, t,
+                               std::format("{} switch byte {}:{}", area ? "room" : "dungeon", room, offset));
+        if (!bits) return;
+        auto& [mask, when] = g_localRecent[key];
+        mask |= bits;
+        when = t;
+        changed = true;
+    };
+    for (int i = 0; i < kDanBytes; i++)
+    {
+        uint8_t v = rd8(kDanSwitches + i);
+        if (g_danValid && v != g_danShadow[i]) local_change(0, 0, i, g_danShadow[i], v);
+        g_danShadow[i] = v;
+    }
+    g_danValid = true;
+    // a zone is compared once its room has stayed loaded a while: a room loading fresh clears its bits, which isn't
+    // a change to pass on
+    for (int k = 0; k < kZoneCount; k++)
+    {
+        uint32_t zone = kZones + k * kZoneSize;
+        int room = (int8_t)rd8(zone);
+        ZoneShadow& z = g_zoneShadow[k];
+        if (room != z.room) z = {room, 0, {}};
+        bool compare = room >= 0 && ++z.age > 30;
+        for (int i = 0; i < kZoneBitBytes; i++)
+        {
+            uint8_t v = rd8(zone + kZoneBits + i);
+            if (compare && v != z.bits[i]) local_change(1, room, i, z.bits[i], v);
+            z.bits[i] = v;
+        }
+    }
+    for (const auto& [from, c] : g_localIn)
+    {
+        if (std::memcmp(from.data(), stage, 8) != 0) continue;
+        uint32_t a = local_addr(c.area, c.room, c.offset);
+        if (!a) continue;
+        uint8_t keep = g_localChurn[local_key(c.area, c.room, c.offset)].muted;
+        uint8_t v = rd8(a), nv = (uint8_t)((v | (c.set & ~keep)) & ~(c.clear & ~keep));
+        if (nv == v) continue;
+        wr8(a, nv);
+        // the shadow follows, so this isn't passed back
+        if (c.area == 0) g_danShadow[c.offset] = nv;
+        else
+            for (ZoneShadow& z : g_zoneShadow)
+                if (z.room == c.room) z.bits[c.offset] = nv;
+        log_info("mp: {} switch byte {}:{} {:02X} -> {:02X} from the room", c.area ? "room" : "dungeon", c.room, c.offset, v, nv);
+    }
+    g_localIn.clear();
+    if (!changed && t - g_localSent < 0.5) return;
+    g_localSent = t;
+    std::vector<uint8_t> out{kEventLocal};
+    out.insert(out.end(), stage, stage + 8);
+    for (auto it = g_localRecent.begin(); it != g_localRecent.end();)
+    {
+        auto [mask, when] = it->second;
+        int area = it->first >> 16, room = (int8_t)(it->first >> 8), offset = it->first & 0xFF;
+        uint32_t a = local_addr(area, room, offset);
+        if (t - when > kChangeResend || !a)
+        {
+            it = g_localRecent.erase(it);
+            continue;
+        }
+        uint8_t v = rd8(a);
+        out.insert(out.end(), {(uint8_t)area, (uint8_t)room, (uint8_t)offset, (uint8_t)(v & mask), (uint8_t)(~v & mask)});
+        ++it;
+    }
+    if (out.size() > 9) g_storyOut.push_back(std::move(out));
+}
+
 void sync_story(bool playing)
 {
     if (!g_joined || !share_story())
     {
         g_storySnapIn.reset();
         g_changesIn.clear();
+        g_localIn.clear();
         return;
     }
     bool host = story_host() == g_id;
@@ -1101,7 +1250,15 @@ void sync_story(bool playing)
     g_storyStable = steady ? g_storyStable + 1 : 0;
     // the save went away (title screen, file select): another file may come back, so compare afresh. Across a stage
     // change the baseline stays: what the game set while loading is compared once the new stage has settled
-    if (!in_game_stage() || !items_valid()) g_storyBaseline = false;
+    if (!in_game_stage() || !items_valid())
+    {
+        if (g_storyBaseline)
+        {
+            if (host) g_storyEpoch++;
+            else g_storyAdopted = false;
+        }
+        g_storyBaseline = false;
+    }
     if (g_storyStable < 30) return;
     double t = now_s();
     std::array<uint8_t, kStoryBytes> now;
@@ -1120,27 +1277,19 @@ void sync_story(bool playing)
         static const bool debug = std::getenv("WF_MP_DEBUG") != nullptr;
         if (debug) log_info("mp: story byte {:03X} {:02X} -> {:02X}", i, g_storyShadow[i], now[i]);
         g_storyShadow[i] = now[i];
-        Churn& c = g_churn[i];
-        if (t - c.since > 20.0)
-        {
-            c.since = t;
-            std::fill(std::begin(c.count), std::end(c.count), 0);
-        }
-        for (int b = 0; b < 8; b++)
-            if ((bits >> b & 1) && !(c.muted >> b & 1) && ++c.count[b] > 8)
-            {
-                c.muted |= (uint8_t)(1 << b);
-                log_info("mp: story byte {:03X} bit {} keeps changing, no longer shared", i, b);
-            }
-        bits &= ~c.muted;
+        bits = unmuted(g_churn[i], bits, t, std::format("story byte {:03X}", i));
         if (!bits || !g_storyAdopted) continue;
         g_recent[i] = {(uint8_t)(g_recent[i].first | bits), t};
         changed = true;
     }
-    // the host's story, once
+    // the host's story: on joining, after this game loads a file, and after the host loads theirs again
+    if (g_storySnapIn && !host && g_storySnapIn->from == g_storyFrom && g_storySnapIn->epoch != g_storyEpochSeen)
+        g_storyAdopted = false;
     if (!g_storyAdopted && g_storySnapIn)
     {
-        const std::vector<uint8_t>& snap = *g_storySnapIn;
+        g_storyFrom = g_storySnapIn->from;
+        g_storyEpochSeen = g_storySnapIn->epoch;
+        const std::vector<uint8_t>& snap = g_storySnapIn->bytes;
         int written = 0;
         for (int i = 0; i < kStoryBytes; i++)
         {
@@ -1180,6 +1329,7 @@ void sync_story(bool playing)
             g_storyShadow[c.offset] = nv;
         }
     g_changesIn.clear();
+    if (g_storyAdopted) sync_local(t);
     // send changes now, and resend the latest state of recently changed bits for a while (packets can be lost; a
     // repeat is harmless since it carries the bits' current values)
     if (changed || (t - g_changesSent > 0.5))
@@ -1201,7 +1351,7 @@ void sync_story(bool playing)
     }
     if (host && t - g_storySent > 3.0)
     {
-        std::vector<uint8_t> out{kEventStory};
+        std::vector<uint8_t> out{kEventStory, g_storyEpoch};
         out.insert(out.end(), now.begin(), now.end());
         g_storyOut.push_back(std::move(out));
         g_storySent = t;
