@@ -79,6 +79,7 @@ struct Settings
     bool mpAutoConnect = false;
     bool mpShowNames = true;
     bool mpShareItems = true;
+    bool mpShareStory = true;
     int mpChatSeconds = 12;
 };
 

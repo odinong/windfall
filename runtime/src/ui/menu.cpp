@@ -1094,8 +1094,12 @@ void tab_multiplayer(settings::Settings& s, bool& dirty)
     if (toggle("Join this room when the game starts", &s.mpAutoConnect)) dirty = true;
     if (toggle("Show names over the other players", &s.mpShowNames)) dirty = true;
     if (toggle("Share items with the room", &s.mpShareItems)) dirty = true;
-    hint("An item anyone picks up goes into everyone's empty item slots (not rupees, hearts or ammo). Only between players "
-         "of the same game: the original game, or the same randomizer seed.");
+    hint("Items, upgrades, equipment, songs, pearls, Triforce pieces and heart containers anyone gets, everyone gets. "
+         "Rupees, ammo and what's in bottles stay yours. Only between players of the same game: the original game, or "
+         "the same randomizer seed.");
+    if (toggle("Share story progress with the room", &s.mpShareStory)) dirty = true;
+    hint("Everyone plays the first player's story: joining takes on their progress (your save file only changes if you "
+         "save) and reloads your area. After that, events, opened chests, switches, keys and bosses carry over.");
     if (slider_int("Chat stays on screen", &s.mpChatSeconds, 3, 60, "%d s")) dirty = true;
 }
 

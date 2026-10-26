@@ -139,6 +139,7 @@ void for_each_value(Settings& s, F&& f)
     f("multiplayer.auto_connect", s.mpAutoConnect);
     f("multiplayer.show_names", s.mpShowNames);
     f("multiplayer.share_items", s.mpShareItems);
+    f("multiplayer.share_story", s.mpShareStory);
     f("multiplayer.chat_seconds", s.mpChatSeconds);
 }
 

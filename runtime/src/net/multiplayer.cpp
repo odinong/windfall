@@ -6,6 +6,7 @@
 #include <winhttp.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -15,9 +16,11 @@
 #include <format>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -102,25 +105,167 @@ struct ChatLine { std::string name, text; double time; int color; };
 std::deque<ChatLine> g_chat;
 std::vector<std::string> g_outbox;
 
-constexpr uint32_t kItemSlots[2] = {0x14822BCC, 0x148D1B40};
-constexpr int kItemSlotCount = 21;
-constexpr uint8_t kEventItem = 1;
-constexpr uint8_t kEventWorld = 2;  // payload: the sender's rando::playing_world() text, resent every few seconds
-uint8_t g_itemsSeen[kItemSlotCount];
-bool g_itemsKnown = false, g_itemsAnnounced = false;
-std::vector<std::pair<uint8_t, uint8_t>> g_itemsIn;
-std::vector<std::pair<uint8_t, uint8_t>> g_itemsOut;
+// the save the game plays from (dSv_player_c). 0x14822A00 holds the packed save file image, which the game only reads
+// when a file is loaded, so writes there never reach the inventory
+constexpr uint32_t kSave = 0x148D196C;
+constexpr uint32_t kItems = kSave + 0x3C, kGotItems = kSave + 0x51;  // item menu slots (0xFF empty), obtained bits per slot
+constexpr uint32_t kArrows = kSave + 0x69, kBombs = kSave + 0x6A, kMaxArrows = kSave + 0x6F, kMaxBombs = kSave + 0x70;
+constexpr uint32_t kWallet = kSave + 0x12, kMaxMagic = kSave + 0x13, kMagic = kSave + 0x14;
+constexpr uint32_t kEquip = kSave + 0x0E;    // worn sword, shield, bracelet item ids
+constexpr uint32_t kCollect = kSave + 0xB4;  // owned bits: swords, shields, bracelets, pirate's charm, hero's charm
+constexpr uint32_t kSongs = kSave + 0xBD, kTriforce = kSave + 0xBE, kPearls = kSave + 0xBF;
+constexpr uint32_t kMaxLife = kSave + 0x00, kLife = kSave + 0x02;
+// story: event flags, each stage group's memory (chests, switches, keys, dungeon items, boss) and the sea's flags.
+// The stage group being played lives in kLiveMemory (kStageNo says which) and goes back to its slot when it's left
+constexpr uint32_t kEvents = kSave + 0x624, kStageMemory = kSave + 0x380, kOcean = kSave + 0x5C0;
+constexpr uint32_t kCharts = kSave + 0xC4;  // treasure/Triforce charts owned, deciphered, salvaged; sea map sectors
+constexpr uint32_t kLiveMemory = kSave + 0x778, kStageNo = kSave + 0x79C;
+constexpr uint32_t kNextStage = 0x104741F0, kNextEnable = 0x104741FC;
+constexpr int kItemSlotCount = 21, kFirstBottle = 14, kBottles = 4, kCollectCount = 5;
+constexpr uint8_t kEmptyBottle = 0x50;
+constexpr uint8_t kEventWorld = 2;      // payload: the sender's rando::playing_world() text, resent every few seconds
+constexpr uint8_t kEventInventory = 3;  // payload: Inventory, sent on change and every few seconds
+
+#pragma pack(push, 1)
+struct Inventory
+{
+    uint8_t items[kItemSlotCount];  // bottles show as empty ones: what's in them stays with their owner
+    uint8_t got[kItemSlotCount];
+    uint8_t maxArrows, maxBombs, wallet, maxMagic;
+    uint8_t collect[kCollectCount];
+    uint8_t maxLife[2];  // as in the save: big-endian quarter hearts
+    uint8_t songs, triforce, pearls;
+};
+#pragma pack(pop)
+static_assert(sizeof(Inventory) == 56);
+
+std::vector<Inventory> g_invIn;
+std::optional<Inventory> g_invOut;
+Inventory g_invSent{};
+bool g_invAnnounced = false;
+double g_invSentTime = 0;
+
+bool is_bottle(int slot) { return slot >= kFirstBottle && slot < kFirstBottle + kBottles; }
+
+// a better version of what a slot already holds
+int item_rank(uint8_t item)
+{
+    switch (item)
+    {
+    case 0x77: return 1;  // Swift Sail
+    case 0x26: return 1;  // Deluxe Picto Box
+    case 0x35: return 1;  // Fire and Ice Arrows
+    case 0x36: return 2;  // Light Arrows
+    default: return 0;
+    }
+}
 
 bool items_valid()
 {
     int filled = 0;
     for (int i = 0; i < kItemSlotCount; i++)
     {
-        uint8_t a = rd8(kItemSlots[0] + i);
+        uint8_t a = rd8(kItems + i);
         if (a == 0x00 || a == 0xFE) return false;
         filled += a != 0xFF;
     }
     return filled > 0;
+}
+
+// a save is being played: not the title screen's demo or file select
+bool in_game_stage()
+{
+    char stage[9] = {};
+    for (int i = 0; i < 8; i++) stage[i] = (char)rd8(kStartStage + i);
+    return stage[0] && std::strcmp(stage, "Name") != 0 && std::strncmp(stage, "sea_T", 5) != 0;
+}
+
+Inventory read_inventory()
+{
+    Inventory v{};
+    for (int i = 0; i < kItemSlotCount; i++)
+    {
+        uint8_t item = rd8(kItems + i);
+        v.items[i] = is_bottle(i) && item != 0xFF ? kEmptyBottle : item;
+        v.got[i] = is_bottle(i) ? 0 : rd8(kGotItems + i);
+    }
+    v.maxArrows = rd8(kMaxArrows);
+    v.maxBombs = rd8(kMaxBombs);
+    v.wallet = rd8(kWallet);
+    v.maxMagic = rd8(kMaxMagic);
+    for (int i = 0; i < kCollectCount; i++) v.collect[i] = rd8(kCollect + i);
+    v.maxLife[0] = rd8(kMaxLife);
+    v.maxLife[1] = rd8(kMaxLife + 1);
+    v.songs = rd8(kSongs);
+    v.triforce = rd8(kTriforce);
+    v.pearls = rd8(kPearls);
+    return v;
+}
+
+// takes whatever a partner has that this save doesn't: items and their upgrades, obtained flags, bigger quiver, bomb bag,
+// wallet and magic meter, and swords, shields and bracelets
+void merge_inventory(const Inventory& in)
+{
+    for (int i = 0; i < kItemSlotCount; i++)
+    {
+        uint8_t mine = rd8(kItems + i), theirs = in.items[i];
+        if (is_bottle(i))
+        {
+            if (theirs != 0xFF && mine == 0xFF)
+            {
+                wr8(kItems + i, kEmptyBottle);
+                log_info("mp: shared an empty bottle into slot {}", i);
+            }
+            continue;
+        }
+        if (theirs != 0xFF && (mine == 0xFF || item_rank(theirs) > item_rank(mine)))
+        {
+            wr8(kItems + i, theirs);
+            log_info("mp: shared item {:02X} into slot {}", theirs, i);
+        }
+        if (in.got[i] & ~rd8(kGotItems + i)) wr8(kGotItems + i, rd8(kGotItems + i) | in.got[i]);
+    }
+    // a bigger capacity comes full, as when the game hands out the upgrade
+    auto raise = [](uint32_t maxAddr, uint32_t curAddr, uint8_t v, const char* what) {
+        if (v <= rd8(maxAddr)) return;
+        wr8(maxAddr, v);
+        if (curAddr) wr8(curAddr, v);
+        log_info("mp: shared {} ({})", what, v);
+    };
+    raise(kMaxArrows, kArrows, in.maxArrows, "quiver");
+    raise(kMaxBombs, kBombs, in.maxBombs, "bomb bag");
+    raise(kMaxMagic, kMagic, in.maxMagic, "magic meter");
+    raise(kWallet, 0, in.wallet, "wallet");
+    if (uint16_t life = (uint16_t)(in.maxLife[0] << 8 | in.maxLife[1]); life > rd16(kMaxLife))
+    {
+        wr16(kMaxLife, life);
+        wr16(kLife, life);
+        log_info("mp: shared hearts ({} quarters)", life);
+    }
+    for (auto [addr, bits, what] : {std::tuple{kSongs, in.songs, "songs"}, {kTriforce, in.triforce, "Triforce pieces"}, {kPearls, in.pearls, "pearls"}})
+        if (bits & ~rd8(addr))
+        {
+            wr8(addr, rd8(addr) | bits);
+            log_info("mp: shared {} ({:02X})", what, rd8(addr));
+        }
+    // a newly gained sword, shield or bracelet is worn, best first
+    static const uint8_t kSwords[] = {0x38, 0x39, 0x3A, 0x3E}, kShields[] = {0x3B, 0x3C}, kBracelets[] = {0x28};
+    static const std::pair<const uint8_t*, int> kWear[] = {{kSwords, 4}, {kShields, 2}, {kBracelets, 1}};
+    for (int c = 0; c < kCollectCount; c++)
+    {
+        uint8_t mine = rd8(kCollect + c), all = mine | in.collect[c];
+        if (all == mine) continue;
+        wr8(kCollect + c, all);
+        log_info("mp: shared equipment {} ({:02X})", c, all);
+        if (c >= 3) continue;
+        auto [ids, n] = kWear[c];
+        for (int b = n - 1; b >= 0; b--)
+            if (all >> b & 1)
+            {
+                wr8(kEquip + c, ids[b]);
+                break;
+            }
+    }
 }
 std::atomic<int> g_id{-1}, g_color{0};
 
@@ -137,6 +282,65 @@ std::map<uint16_t, LocalPose> g_localPose;
 struct LocalRigid { uint32_t frame; std::vector<int16_t> q; };
 std::map<uint32_t, LocalRigid> g_localRigid;
 std::map<int, Remote> g_remotes;
+
+// Story sync. Everyone plays the host's story (the first player in the room among those playing the same world): a
+// player who joins takes on the host's story once (a snapshot), and after that every change anyone's game makes to the
+// story bytes goes to everyone as bit changes. Bits the games keep flipping against each other (a switch only held
+// down in one game, a flag that follows where each player is) stop being shared; the rest of their byte still is.
+constexpr int kEventBytes = 0x100, kMemBytes = 0x24, kMemCount = 16, kOceanBytes = 0x64, kChartBytes = 0x81;
+constexpr int kStoryMemory = kEventBytes, kStoryOcean = kStoryMemory + kMemBytes * kMemCount, kStoryCharts = kStoryOcean + kOceanBytes;
+constexpr int kStoryBytes = kStoryCharts + kChartBytes;
+constexpr uint8_t kEventStory = 4;   // payload: the host's story bytes, every few seconds
+constexpr uint8_t kEventChange = 5;  // payload: {u16 offset, u8 set, u8 clear}... (offsets into the story bytes)
+constexpr double kChangeResend = 2.0;
+
+struct StoryChange { uint16_t offset; uint8_t set, clear; };
+struct Churn { double since = 0; uint8_t count[8] = {}; uint8_t muted = 0; };  // per bit
+std::array<uint8_t, kStoryBytes> g_storyShadow{};
+std::array<Churn, kStoryBytes> g_churn{};
+std::array<std::pair<uint8_t, double>, kStoryBytes> g_recent{};  // bits changed here lately and when, resent a while
+std::optional<std::vector<uint8_t>> g_storySnapIn;
+std::vector<StoryChange> g_changesIn;
+std::vector<std::vector<uint8_t>> g_storyOut;  // event kind + payload
+bool g_storyBaseline = false, g_storyAdopted = false;
+int g_storyStable = 0, g_storyGroup = -2;
+double g_storySent = 0, g_changesSent = 0;
+
+int stage_group()
+{
+    int n = (int8_t)rd8(kStageNo);
+    return n >= 0 && n < kMemCount ? n : -1;
+}
+
+uint32_t story_addr(int offset, int group)
+{
+    if (offset < kStoryMemory) return kEvents + offset;
+    if (offset >= kStoryCharts) return kCharts + offset - kStoryCharts;
+    if (offset >= kStoryOcean) return kOcean + offset - kStoryOcean;
+    int i = (offset - kStoryMemory) / kMemBytes, b = (offset - kStoryMemory) % kMemBytes;
+    return i == group ? kLiveMemory + b : kStageMemory + i * kMemBytes + b;
+}
+
+// the host is the first one in the room (lowest id) of those playing the same world
+int story_host()
+{
+    int host = g_id;
+    for (const auto& [id, r] : g_remotes)
+        if (r.world == rando::playing_world() && id < host) host = id;
+    return host;
+}
+
+void reset_story()
+{
+    g_storyBaseline = g_storyAdopted = false;
+    g_storyStable = 0;
+    g_storySnapIn.reset();
+    g_changesIn.clear();
+    g_storyOut.clear();
+    g_churn = {};
+    g_recent = {};
+}
+
 
 void put_str(std::vector<uint8_t>& out, const std::string& s, size_t n)
 {
@@ -261,9 +465,17 @@ void handle(const uint8_t* d, int n)
             }
             // items only go between players of the same world: in different randomizer seeds (or the original game)
             // the same item unlocks different things
-            else if (n >= 9 && d[6] == kEventItem && d[7] < kItemSlotCount && it != g_remotes.end() &&
+            else if (n >= 7 + (int)sizeof(Inventory) && d[6] == kEventInventory && it != g_remotes.end() &&
                      it->second.world == rando::playing_world())
-                g_itemsIn.push_back({d[7], d[8]});
+            {
+                Inventory inv;
+                memcpy(&inv, d + 7, sizeof inv);
+                g_invIn.push_back(inv);
+            }
+            else if (d[6] == kEventStory && n == 7 + kStoryBytes && d[1] == story_host() && !g_storyAdopted)
+                g_storySnapIn.emplace(d + 7, d + n);
+            else if (d[6] == kEventChange && it != g_remotes.end() && it->second.world == rando::playing_world())
+                for (int i = 7; i + 4 <= n; i += 4) g_changesIn.push_back({(uint16_t)(d[i] | d[i + 1] << 8), d[i + 2], d[i + 3]});
         }
         break;
     case 'C':
@@ -448,15 +660,28 @@ void run()
                 pkt.insert(pkt.end(), text.begin(), text.begin() + std::min<size_t>(text.size(), 200));
                 send_pkt(pkt);
             }
-            std::vector<std::pair<uint8_t, uint8_t>> items;
+            std::optional<Inventory> inv;
             {
                 std::lock_guard lk(g_lock);
-                items.swap(g_itemsOut);
+                inv.swap(g_invOut);
             }
-            for (const auto& [slot, item] : items)
+            if (inv)
             {
                 seq++;
-                pkt.assign({'E', (uint8_t)g_id.load(), (uint8_t)seq, (uint8_t)(seq >> 8), (uint8_t)(seq >> 16), (uint8_t)(seq >> 24), kEventItem, slot, item});
+                pkt.assign({'E', (uint8_t)g_id.load(), (uint8_t)seq, (uint8_t)(seq >> 8), (uint8_t)(seq >> 16), (uint8_t)(seq >> 24), kEventInventory});
+                pkt.insert(pkt.end(), (const uint8_t*)&*inv, (const uint8_t*)&*inv + sizeof(Inventory));
+                send_pkt(pkt);
+            }
+            std::vector<std::vector<uint8_t>> story;
+            {
+                std::lock_guard lk(g_lock);
+                story.swap(g_storyOut);
+            }
+            for (const std::vector<uint8_t>& ev : story)
+            {
+                seq++;
+                pkt.assign({'E', (uint8_t)g_id.load(), (uint8_t)seq, (uint8_t)(seq >> 8), (uint8_t)(seq >> 16), (uint8_t)(seq >> 24)});
+                pkt.insert(pkt.end(), ev.begin(), ev.end());
                 send_pkt(pkt);
             }
             static double s_worldSent = 0;
@@ -593,11 +818,12 @@ void connect(const std::string& server, const std::string& room, const std::stri
     g_joined = false;
     g_id = -1;
     g_wsUrl.clear();
-    g_itemsKnown = g_itemsAnnounced = false;
+    g_invAnnounced = false;
     {
         std::lock_guard lk(g_lock);
         g_remotes.clear();
         g_outbox.clear();
+        reset_story();
     }
     set_status("Connecting to " + server + "...");
     if (std::string_view(server).starts_with("ws://") || std::string_view(server).starts_with("wss://"))
@@ -847,29 +1073,160 @@ int player_count()
     return (int)g_remotes.size() + 1;
 }
 
-void sync_items(bool playing)
+bool share_story()
 {
-    if (!g_joined || !playing || !items_valid() || !share_items())
+    std::lock_guard lk(settings::lock());
+    return settings::get().mpShareStory;
+}
+
+void sync_story(bool playing)
+{
+    if (!g_joined || !share_story())
     {
-        g_itemsIn.clear();
+        g_storySnapIn.reset();
+        g_changesIn.clear();
         return;
     }
-    for (const auto& [slot, item] : g_itemsIn)
+    bool host = story_host() == g_id;
+    if (host && !g_storyAdopted)
     {
-        if (item == 0xFF || rd8(kItemSlots[0] + slot) != 0xFF) continue;
-        for (uint32_t base : kItemSlots) wr8(base + slot, item);
-        g_itemsSeen[slot] = item;
-        log_info("mp: shared item {:02X} into slot {}", item, slot);
+        g_storyAdopted = true;
+        g_storyBaseline = false;
+        log_info("mp: hosting the room's story");
     }
-    g_itemsIn.clear();
-    for (int i = 0; i < kItemSlotCount; i++)
+    // only while a stage has been playing steadily: around stage changes the game moves memory between slots
+    int group = stage_group();
+    bool steady = playing && in_game_stage() && items_valid() && !rd8(kNextEnable) && group == g_storyGroup;
+    g_storyGroup = group;
+    g_storyStable = steady ? g_storyStable + 1 : 0;
+    // the save went away (title screen, file select): another file may come back, so compare afresh. Across a stage
+    // change the baseline stays: what the game set while loading is compared once the new stage has settled
+    if (!in_game_stage() || !items_valid()) g_storyBaseline = false;
+    if (g_storyStable < 30) return;
+    double t = now_s();
+    std::array<uint8_t, kStoryBytes> now;
+    for (int i = 0; i < kStoryBytes; i++) now[i] = rd8(story_addr(i, group));
+    if (!g_storyBaseline)
     {
-        uint8_t v = rd8(kItemSlots[0] + i);
-        bool announce = !g_itemsAnnounced ? v != 0xFF : g_itemsKnown && v != 0xFF && v != g_itemsSeen[i];
-        if (announce) g_itemsOut.push_back({(uint8_t)i, v});
-        g_itemsSeen[i] = v;
+        g_storyShadow = now;
+        g_storyBaseline = true;
     }
-    g_itemsKnown = g_itemsAnnounced = true;
+    // what this game changed
+    bool changed = false;
+    for (int i = 0; i < kStoryBytes; i++)
+    {
+        if (now[i] == g_storyShadow[i]) continue;
+        uint8_t bits = now[i] ^ g_storyShadow[i];
+        static const bool debug = std::getenv("WF_MP_DEBUG") != nullptr;
+        if (debug) log_info("mp: story byte {:03X} {:02X} -> {:02X}", i, g_storyShadow[i], now[i]);
+        g_storyShadow[i] = now[i];
+        Churn& c = g_churn[i];
+        if (t - c.since > 20.0)
+        {
+            c.since = t;
+            std::fill(std::begin(c.count), std::end(c.count), 0);
+        }
+        for (int b = 0; b < 8; b++)
+            if ((bits >> b & 1) && !(c.muted >> b & 1) && ++c.count[b] > 8)
+            {
+                c.muted |= (uint8_t)(1 << b);
+                log_info("mp: story byte {:03X} bit {} keeps changing, no longer shared", i, b);
+            }
+        bits &= ~c.muted;
+        if (!bits || !g_storyAdopted) continue;
+        g_recent[i] = {(uint8_t)(g_recent[i].first | bits), t};
+        changed = true;
+    }
+    // the host's story, once
+    if (!g_storyAdopted && g_storySnapIn)
+    {
+        const std::vector<uint8_t>& snap = *g_storySnapIn;
+        int written = 0;
+        for (int i = 0; i < kStoryBytes; i++)
+        {
+            uint8_t keep = g_churn[i].muted, v = (uint8_t)((snap[i] & ~keep) | (now[i] & keep));
+            if (v == now[i]) continue;
+            wr8(story_addr(i, group), v);
+            g_storyShadow[i] = v;
+            written++;
+        }
+        g_storyAdopted = true;
+        g_storySnapIn.reset();
+        g_changesIn.clear();
+        log_info("mp: took on the host's story ({} bytes differed)", written);
+        // reload the area so what's in it follows the new story
+        if (written)
+        {
+            for (uint32_t i = 0; i < 12; i++) wr8(kNextStage + i, rd8(kStartStage + i));
+            wr8(kNextStage + 11, 0xFF);
+            wr8(kNextEnable, 1);
+            log_info("mp: reloading the area for the new story");
+        }
+        return;
+    }
+    // everyone else's changes
+    if (g_storyAdopted)
+        for (const StoryChange& c : g_changesIn)
+        {
+            if (c.offset >= kStoryBytes) continue;
+            uint8_t keep = g_churn[c.offset].muted;
+            uint32_t a = story_addr(c.offset, group);
+            uint8_t v = rd8(a), nv = (uint8_t)((v | (c.set & ~keep)) & ~(c.clear & ~keep));
+            if (nv != v)
+            {
+                wr8(a, nv);
+                log_info("mp: story byte {:03X} {:02X} -> {:02X} from the room", c.offset, v, nv);
+            }
+            g_storyShadow[c.offset] = nv;
+        }
+    g_changesIn.clear();
+    // send changes now, and resend the latest state of recently changed bits for a while (packets can be lost; a
+    // repeat is harmless since it carries the bits' current values)
+    if (changed || (t - g_changesSent > 0.5))
+    {
+        std::vector<uint8_t> out{kEventChange};
+        for (int i = 0; i < kStoryBytes && out.size() < 1000; i++)
+        {
+            auto& [bits, when] = g_recent[i];
+            if (!bits) continue;
+            if (t - when > kChangeResend)
+            {
+                bits = 0;
+                continue;
+            }
+            out.insert(out.end(), {(uint8_t)i, (uint8_t)(i >> 8), (uint8_t)(now[i] & bits), (uint8_t)(~now[i] & bits)});
+        }
+        if (out.size() > 1) g_storyOut.push_back(std::move(out));
+        g_changesSent = t;
+    }
+    if (host && t - g_storySent > 3.0)
+    {
+        std::vector<uint8_t> out{kEventStory};
+        out.insert(out.end(), now.begin(), now.end());
+        g_storyOut.push_back(std::move(out));
+        g_storySent = t;
+    }
+}
+
+void sync_items(bool playing)
+{
+    if (!g_joined || !playing || !in_game_stage() || !items_valid() || !share_items())
+    {
+        g_invIn.clear();
+        return;
+    }
+    for (const Inventory& in : g_invIn) merge_inventory(in);
+    g_invIn.clear();
+    // resent every few seconds too, so someone who joins later catches up
+    Inventory now = read_inventory();
+    double t = now_s();
+    if (!g_invAnnounced || memcmp(&now, &g_invSent, sizeof now) != 0 || t - g_invSentTime > 3.0)
+    {
+        g_invOut = now;
+        g_invSent = now;
+        g_invSentTime = t;
+        g_invAnnounced = true;
+    }
 }
 
 void tick()
@@ -889,6 +1246,7 @@ void tick()
     uint32_t actor = rd32(kPlayerPtr);
     std::lock_guard lk(g_lock);
     sync_items(actor != 0);
+    sync_story(actor != 0);
     g_localValid = false;
     if (actor < 0x10000000 || actor >= 0x50000000) return;
     LinkView& v = g_local;
