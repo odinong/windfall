@@ -370,17 +370,17 @@ uint32_t lerp_word(uint32_t prev, uint32_t value)
 // lerped, the rotation is slerped (as a quaternion) and each axis' scale lerped, so a part turning fast keeps its shape
 // in between. A part that turned more than ~100 degrees in one tick (a flip, like Link's hat when his head goes
 // upside down in a roll) takes the new matrix: there is no sensible halfway, and blending it sheared the mesh.
-void lerp_affine(const uint32_t* prev, const uint32_t* cur, uint32_t* out)
+bool lerp_affine(const uint32_t* prev, const uint32_t* cur, uint32_t* out)
 {
     static const bool plain = std::getenv("WF_60FPS_PLAINLERP") != nullptr;
     if (plain)
     {
         for (int i = 0; i < 12; i++) out[i] = lerp_word(prev[i], cur[i]);
-        return;
+        return true;
     }
     const float s = g_step.load(std::memory_order_relaxed);
     auto f = [](uint32_t w) { return std::bit_cast<float>(w); };
-    auto take_cur = [&] { std::copy(cur, cur + 12, out); };
+    auto take_cur = [&] { std::copy(cur, cur + 12, out); return false; };
     // columns, their lengths (scale) and the rotation with the scale taken out
     double ra[3][3], rb[3][3], sa[3], sb[3];
     for (int c = 0; c < 3; c++)
@@ -449,7 +449,7 @@ void lerp_affine(const uint32_t* prev, const uint32_t* cur, uint32_t* out)
     if (det(ra) <= 0 || det(rb) <= 0)
     {
         for (int i = 0; i < 12; i++) out[i] = lerp_word(prev[i], cur[i]);
-        return;
+        return true;
     }
     double qa[4], qb[4];
     to_quat(ra, qa);
@@ -481,6 +481,7 @@ void lerp_affine(const uint32_t* prev, const uint32_t* cur, uint32_t* out)
         for (int r = 0; r < 3; r++) out[r * 4 + c] = std::bit_cast<uint32_t>((float)(m[r][c] * sc));
     }
     for (int r = 0; r < 3; r++) out[r * 4 + 3] = lerp_word(prev[r * 4 + 3], cur[r * 4 + 3]);
+    return true;
 }
 
 std::mutex g_cameraLock;
@@ -2222,9 +2223,42 @@ PPC_FUNC(hook_skin_palette)
     std::copy(words, words + n, f.cur.begin());
     if (interpolate)
     {
+        // a skin's bones share vertices: when one bone has to snap (turned too far this tick), the whole skin takes this
+        // tick's pose, or the vertices between a snapped bone and a blended neighbour stretch out
         uint32_t whole = n / 12 * 12;
-        for (uint32_t m = 0; m < whole; m += 12) game::lerp_affine(f.prev.data() + m, f.cur.data() + m, words + m);
-        for (uint32_t i = whole; i < n; i++) words[i] = game::lerp_word(f.prev[i], f.cur[i]);
+        thread_local std::vector<uint32_t> t_blend;
+        t_blend.resize(n);
+        bool all = true;
+        for (uint32_t m = 0; m < whole && all; m += 12) all = game::lerp_affine(f.prev.data() + m, f.cur.data() + m, t_blend.data() + m);
+        if (all)
+        {
+            for (uint32_t i = whole; i < n; i++) t_blend[i] = game::lerp_word(f.prev[i], f.cur[i]);
+            std::copy(t_blend.begin(), t_blend.end(), words);
+        }
+    }
+    static uint32_t s_angFirst = 0, s_angLast = 0;
+    static bool s_angInit = false;
+    if (!s_angInit)
+    {
+        s_angInit = true;
+        if (const char* e = std::getenv("WF_60FPS_SKINANGLE")) std::sscanf(e, "%u-%u", &s_angFirst, &s_angLast);
+    }
+    if (s_angLast && frame >= s_angFirst && frame <= s_angLast && f.prev.size() == n)
+    {
+        // per 12-word entry: the angle between the previous tick's and this tick's first column, and the column lengths
+        std::string out;
+        float worst = 0;
+        auto fl = [](uint32_t w) { return std::bit_cast<float>(w); };
+        for (uint32_t m = 0; m + 12 <= n; m += 12)
+        {
+            float ax = fl(f.prev[m]), ay = fl(f.prev[m + 4]), az = fl(f.prev[m + 8]), bx = fl(f.cur[m]), by = fl(f.cur[m + 4]), bz = fl(f.cur[m + 8]);
+            float la = std::sqrt(ax * ax + ay * ay + az * az), lb = std::sqrt(bx * bx + by * by + bz * bz);
+            float ang = la > 0 && lb > 0 ? std::acos(std::clamp((ax * bx + ay * by + az * bz) / (la * lb), -1.0f, 1.0f)) * 57.3f : 0;
+            worst = std::max(worst, ang);
+            if (ang > 25) out += std::format(" [{}] {:.0f}deg len {:.2f}>{:.2f}", m / 12, ang, la, lb);
+        }
+        if (worst > 25) log_info("skin angle frame {} {} step {:.3f} obj {:08X} idx {} n {} worst {:.0f}:{}", frame, game::g_logicFrame ? "logic" : "draw",
+                                 game::g_step.load(), obj, index, n, worst, out);
     }
     if (frame >= s_logFirst && frame <= s_logLast && s_logLast && n >= 32)
     {
