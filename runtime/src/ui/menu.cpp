@@ -1100,6 +1100,12 @@ void tab_multiplayer(settings::Settings& s, bool& dirty)
     if (toggle("Share story progress with the room", &s.mpShareStory)) dirty = true;
     hint("Everyone plays the first player's story: joining takes on their progress (your save file only changes if you "
          "save) and reloads your area. After that, events, opened chests, switches, keys and bosses carry over.");
+    if (toggle("Share enemies and bosses", &s.mpShareEnemies)) dirty = true;
+    hint("Players in the same place fight the same enemies: damage anyone deals counts for everyone, and an enemy one "
+         "player defeats is gone for the others. When the player who beats a boss takes the warp, everyone else in "
+         "that dungeon goes with them.");
+    if (toggle("Watch story cutscenes together", &s.mpShareCutscenes)) dirty = true;
+    hint("When a story cutscene takes someone to another place, the players in the same spot go along and watch it too.");
     if (slider_int("Chat stays on screen", &s.mpChatSeconds, 3, 60, "%d s")) dirty = true;
 }
 

@@ -5,11 +5,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <format>
 #include <string>
 
 #include "core/log.h"
 #include "gpu/gpu.h"
 #include "core/guest.h"
+#include "enhancements/actors.h"
 
 namespace wf::playtest {
 namespace {
@@ -49,6 +51,42 @@ void set_phase(Phase p, const char* what)
     log_info("playtest: {}", what);
 }
 
+// WF_ACTORS=<frame>[,<frame>...]: logs every actor (and dumps its first 0x600 bytes) at those frames
+void debug_actors()
+{
+    static const char* spec = std::getenv("WF_ACTORS");
+    if (!spec) return;
+    uint32_t frame = gpu::frame_count();
+    static uint32_t s_last = 0;
+    bool due = false;
+    for (const char* p = spec; *p;)
+    {
+        uint32_t f = (uint32_t)std::strtoul(p, nullptr, 10);
+        if (f <= frame && f > s_last) due = true;
+        p = std::strchr(p, ',');
+        if (!p) break;
+        p++;
+    }
+    s_last = frame;
+    if (!due) return;
+    int n = 0;
+    actors::for_each([&](uint32_t a) {
+        auto f32 = [](uint32_t x) { return std::bit_cast<float>(rd32(x)); };
+        log_info("actor {:08X} proc {:04X} home {:.0f} {:.0f} {:.0f} room {} param {:08X}", a, actors::proc_name(a),
+                 f32(a + actors::kHome), f32(a + actors::kHome + 4), f32(a + actors::kHome + 8),
+                 (int8_t)rd8(a + actors::kHome + actors::kPlaceRoom), rd32(a + 0xB0));
+        std::string name = std::format("actor_{}_{:04X}_{:08X}.bin", frame, actors::proc_name(a), a);
+        if (FILE* f = std::fopen(name.c_str(), "wb"))
+        {
+            std::fwrite(gptr(a), 1, 0x600, f);
+            std::fclose(f);
+        }
+        n++;
+        return true;
+    });
+    log_info("actors: {} at frame {}", n, frame);
+}
+
 void debug_player(bool arriving)
 {
     constexpr uint32_t kPlayerPtr = 0x1047428C, kOld = 0x300, kPos = 0x314, kAngle = 0x320, kShapeAngle = 0x328;
@@ -68,12 +106,17 @@ void debug_player(bool arriving)
     if (posLog && s_ticks % 30 == 0)
         log_info("player tick {} pos {:.0f} {:.0f} {:.0f} angle {}", s_ticks, f32(pl + kPos), f32(pl + kPos + 4), f32(pl + kPos + 8),
                  (int16_t)rd16(pl + kShapeAngle + 2));
+    // WF_TELEPORT_FRAME: the numbers are frames (gpu::frame_count) instead of ticks since arriving
+    static const bool byFrame = std::getenv("WF_TELEPORT_FRAME") != nullptr;
+    static uint32_t s_lastFrame = 0;
+    uint32_t frame = gpu::frame_count(), lastFrame = s_lastFrame;
+    s_lastFrame = frame;
     for (const char* p = teleport; p && *p;)
     {
         unsigned tick = 0;
         float x, y, z;
         int angle = 0;
-        if (std::sscanf(p, "%u:%f,%f,%f,%d", &tick, &x, &y, &z, &angle) >= 4 && tick == s_ticks)
+        if (std::sscanf(p, "%u:%f,%f,%f,%d", &tick, &x, &y, &z, &angle) >= 4 && (byFrame ? tick > lastFrame && tick <= frame : tick == s_ticks))
         {
             for (uint32_t at : {kPos, kOld})
             {
@@ -120,6 +163,7 @@ void apply(input::ProState& s, bool& fastForward)
 void tick()
 {
     debug_player(driving());
+    debug_actors();
     // a normal launch: "arrival" is when the player has been in a stage for 2 seconds (scripted test input counts from it)
     if (!enabled() && !g_arrivalFrame)
     {

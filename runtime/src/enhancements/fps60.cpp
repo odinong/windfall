@@ -1202,6 +1202,7 @@ PPC_FUNC(hook_task_calc)
             cheats::apply_frame();
             playtest::tick();
             mp::tick();
+            mp::run_game_calls(ctx);
             mods::tick();
         }
         sub_02746790_orig(ctx, base);
@@ -1282,6 +1283,7 @@ PPC_FUNC(hook_task_calc)
         cheats::apply_frame();
         playtest::tick();
         mp::tick();
+        mp::run_game_calls(ctx);
         mods::tick();
     }
     game::g_logicFrame = logic;

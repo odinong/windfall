@@ -132,6 +132,9 @@ void start_watch(const char* spec)
     uint32_t off = plus == std::string::npos ? 0 : (uint32_t)std::stoul(s.substr(plus + 1), nullptr, 16);
     AddVectoredExceptionHandler(1, watch_handler);
     std::thread([=] {
+        // WF_WATCH_FRAME: arm only from that frame on (the address may belong to something else before)
+        if (const char* f = std::getenv("WF_WATCH_FRAME"))
+            while (gpu::frame_count() < (uint32_t)std::atoi(f)) std::this_thread::sleep_for(std::chrono::milliseconds(5));
         uint32_t target = ptr + off;
         if (indirect)
         {

@@ -80,6 +80,8 @@ struct Settings
     bool mpShowNames = true;
     bool mpShareItems = true;
     bool mpShareStory = true;
+    bool mpShareEnemies = true;
+    bool mpShareCutscenes = true;
     int mpChatSeconds = 12;
 };
 

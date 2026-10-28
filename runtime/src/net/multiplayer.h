@@ -5,6 +5,10 @@
 #include <array>
 #include <vector>
 
+namespace wf {
+struct PPCContext;
+}
+
 namespace wf::mp {
 
 void start();
@@ -31,6 +35,8 @@ void render_chat();
 bool chat_open();
 void on_chat_event(const void* sdlEvent);
 void tick();
+// game calls tick() decided on (removing enemies a partner defeated); needs the game thread's context
+void run_game_calls(wf::PPCContext& ctx);
 void render_overlay();
 bool connected();
 std::string room_code();

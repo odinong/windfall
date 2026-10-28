@@ -140,6 +140,8 @@ void for_each_value(Settings& s, F&& f)
     f("multiplayer.show_names", s.mpShowNames);
     f("multiplayer.share_items", s.mpShareItems);
     f("multiplayer.share_story", s.mpShareStory);
+    f("multiplayer.share_enemies", s.mpShareEnemies);
+    f("multiplayer.share_cutscenes", s.mpShareCutscenes);
     f("multiplayer.chat_seconds", s.mpChatSeconds);
 }
 

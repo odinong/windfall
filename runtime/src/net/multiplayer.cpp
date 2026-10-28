@@ -15,6 +15,7 @@
 #include <deque>
 #include <format>
 #include <map>
+#include <set>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -34,6 +35,9 @@
 #include "ui/settings.h"
 #include "enhancements/randomizer.h"
 #include "enhancements/camera.h"
+#include "enhancements/actors.h"
+#include "hle/hle.h"
+#include "wf/ppc.h"
 
 namespace wf::mp {
 namespace {
@@ -151,6 +155,13 @@ double g_invSentTime = 0;
 
 bool is_bottle(int slot) { return slot >= kFirstBottle && slot < kFirstBottle + kBottles; }
 
+// what this game's own story took away (the Forsaken Fortress takes the sword, a pearl set in its statue may go):
+// the room doesn't hand it back until this game gives it back itself
+bool g_takenSlot[kItemSlotCount] = {};
+uint8_t g_takenCollect[kCollectCount] = {}, g_takenPearls = 0;
+Inventory g_invLocal{};
+bool g_invLocalKnown = false;
+
 // a better version of what a slot already holds
 int item_rank(uint8_t item)
 {
@@ -222,7 +233,7 @@ void merge_inventory(const Inventory& in)
             }
             continue;
         }
-        if (theirs != 0xFF && (mine == 0xFF || item_rank(theirs) > item_rank(mine)))
+        if (theirs != 0xFF && !g_takenSlot[i] && (mine == 0xFF || item_rank(theirs) > item_rank(mine)))
         {
             wr8(kItems + i, theirs);
             log_info("mp: shared item {:02X} into slot {}", theirs, i);
@@ -246,7 +257,8 @@ void merge_inventory(const Inventory& in)
         wr16(kLife, life);
         log_info("mp: shared hearts ({} quarters)", life);
     }
-    for (auto [addr, bits, what] : {std::tuple{kSongs, in.songs, "songs"}, {kTriforce, in.triforce, "Triforce pieces"}, {kPearls, in.pearls, "pearls"}})
+    for (auto [addr, bits, what] : {std::tuple{kSongs, in.songs, "songs"}, {kTriforce, in.triforce, "Triforce pieces"},
+                                    {kPearls, (uint8_t)(in.pearls & ~g_takenPearls), "pearls"}})
         if (bits & ~rd8(addr))
         {
             wr8(addr, rd8(addr) | bits);
@@ -257,7 +269,7 @@ void merge_inventory(const Inventory& in)
     static const std::pair<const uint8_t*, int> kWear[] = {{kSwords, 4}, {kShields, 2}, {kBracelets, 1}};
     for (int c = 0; c < kCollectCount; c++)
     {
-        uint8_t mine = rd8(kCollect + c), all = mine | in.collect[c];
+        uint8_t mine = rd8(kCollect + c), all = mine | (in.collect[c] & ~g_takenCollect[c]);
         if (all == mine) continue;
         wr8(kCollect + c, all);
         log_info("mp: shared equipment {} ({:02X})", c, all);
@@ -319,6 +331,83 @@ std::map<uint32_t, std::pair<uint8_t, double>> g_localRecent;
 std::map<uint32_t, Churn> g_localChurn;
 std::vector<std::pair<std::array<char, 8>, LocalChange>> g_localIn;
 double g_localSent = 0;
+
+// Enemies: anything locked onto in battle, matched between games by profile, room and spawn point. Damage is shared
+// (each game keeps the lowest health anyone reported) and an enemy another player defeated is removed here.
+constexpr uint32_t kAttnFlags = 0x39C, kMaxHealth = 0x3A0, kHealth = 0x3A1;
+constexpr uint32_t kAttnBattle = 4;
+constexpr uint16_t kProcPlayer = 0x00A8;
+constexpr uint32_t kFpcDtDelete = 0x025DE1B8;  // fpcDt_Delete(process): queues it for deletion, as an enemy's death does
+constexpr uint8_t kEventEnemy = 7;  // payload: stage[8], {u32 key, s8 health}...
+constexpr uint8_t kEventWarp = 8;   // payload: s8 stage group, next stage {name[8], s16 point, s8 room, s8 layer}
+constexpr uint8_t kEventEnemyPos = 9;  // payload: stage[8], f32 time in the stage, {u32 key, f32 x, y, z, s16 angle, s16 shape angle}...
+// where enemies are: the player nearest an enemy runs it (their game's copy moves it); everyone else's copy follows
+struct EnemyPos { float x, y, z; int16_t angle, shape; double time; int from; };
+std::map<uint32_t, EnemyPos> g_enemyPosIn;
+std::array<char, 8> g_enemyPosStage{};
+std::map<uint32_t, int> g_enemyOwner;
+double g_enemyPosSent = 0;
+struct StageTime { std::array<char, 8> stage; float seconds; double received; };
+std::map<int, StageTime> g_stageTime;  // how long each other player has been in their stage, as they last said
+double g_stageSince = 0;               // when this game came into its stage
+// pickups the room already took (a chest or heart still showing as there here): a heart container or key gained
+// without anything else in the story changing around it is a second copy of the same pickup, and is taken back
+double g_lastStoryBitTime = -100;
+struct HeldKey { int offset; uint8_t before, after; double time; };
+std::vector<HeldKey> g_heldKeys;
+uint16_t g_lifeSeen = 0;
+bool g_lifeKnown = false;
+struct HeldLife { uint16_t amount; double time; };
+std::vector<HeldLife> g_heldLife;
+struct EnemySeen { uint32_t actor; int8_t health; };
+std::map<uint32_t, EnemySeen> g_enemies;
+std::map<uint32_t, std::pair<int8_t, double>> g_enemyRecent;  // health this game dealt lately, resent a while
+// the lowest health the others reported for each enemy, held for the copy that was alive here when it came: one that
+// comes back later (the room loaded again) is a fresh enemy, as it would be in the game (a key carrier drops its key)
+struct EnemyFloor { int8_t health; uint32_t actor; };
+std::map<uint32_t, EnemyFloor> g_enemyFloor;
+std::vector<std::pair<std::array<char, 8>, std::pair<uint32_t, int8_t>>> g_enemyIn;
+std::vector<uint32_t> g_enemyDelete;  // actors to remove, done by run_game_calls
+std::vector<uint32_t> g_actorRebuild; // actors to make again from their placement, done by run_game_calls
+// chests and doors read the save once, when made: after the room changes one in the area this game is in, they're
+// made again (once the player isn't right next to them) so they show it
+bool g_staleChests = false, g_staleDoors = false;
+double g_staleSince = 0;
+std::set<uint64_t> g_staleDone;  // placements (profile and spot) already made again for the current change
+constexpr uint32_t kFopAcmCreate = 0x025D5928;  // fopAcM_create(proc, param, pos*, room, angle*, scale*, subtype, func)
+constexpr uint32_t kCurrentLayer = 0x101F3AE8;  // fpcLy_CurrentLayer: new processes join this layer
+constexpr uint32_t kProcLayer = 0x2C;           // a process's layer (its layer tag's layer pointer)
+// heaps: processes are made under the game heap, with the heap to go back to kept in mDoExt's save slot (the frame
+// handler sets both up around the stage's processes; making one between frames has to do the same)
+constexpr uint32_t kGameHeap = 0x025EE048, kSetCurrentHeap = 0x02756170, kHeapMgr = 0x101F8B4C, kSavedHeap = 0x1048CED8;
+constexpr uint32_t kParam = 0xB0, kOrigAngle = 0x2F8, kOrigRoom = 0x2FE, kScale = 0x330, kSubtype = 0x2DD, kSetId = 0x2D8;
+std::set<uint32_t> g_enemyGone;       // actors already removed this stage visit
+char g_enemyStage[8] = {};
+double g_enemySent = 0;
+// boss warp: the dungeon group whose boss this game beat, then the warp out of it
+int g_bossGroup = -1;
+double g_bossTime = 0;
+bool g_warpSent = false;
+struct PendingWarp { int group; uint8_t dest[12]; double time; };
+std::optional<PendingWarp> g_warpIn;
+// story cutscenes that start with a stage change into one of the stage's event layers (ordinary doors and exits ask
+// for layer -1): players in the same stage and room are taken along, so everyone watches it
+constexpr uint8_t kEventFollow = 10;  // payload: stage[8], s8 room (-128: everyone), f32 x, z, next stage {name[8], s16 point, s8 room, s8 layer}
+constexpr float kFollowReach = 1500.0f;  // a cutscene takes along the players this close (a whole island is one room)
+constexpr int8_t kEveryone = -128;
+// the ending (after Ganondorf falls the game goes to the ending sea): everyone playing the same game goes along,
+// wherever they are, so the whole room watches it together
+bool ending_stage(uint32_t stageAddr)
+{
+    static const char kEnding[] = "ENDumi";
+    for (int i = 0; i < 6; i++)
+        if ((char)rd8(stageAddr + i) != kEnding[i]) return false;
+    return true;
+}
+struct PendingFollow { std::array<char, 8> stage; int room; float x, z; uint8_t dest[12]; double time; std::string who; };
+std::optional<PendingFollow> g_followIn;
+bool g_nextWasSet = false;   // the stage change request was already up last tick
+bool g_ownRequest = false;   // the request up now is one this code made (not to be passed on)
 std::vector<StoryChange> g_changesIn;
 std::vector<std::vector<uint8_t>> g_storyOut;  // event kind + payload
 bool g_storyBaseline = false, g_storyAdopted = false;
@@ -363,6 +452,22 @@ void reset_story()
     g_localRecent.clear();
     g_localChurn.clear();
     g_localIn.clear();
+    g_enemies.clear();
+    g_enemyRecent.clear();
+    g_enemyFloor.clear();
+    g_enemyIn.clear();
+    g_enemyDelete.clear();
+    g_enemyGone.clear();
+    std::memset(g_enemyStage, 0, sizeof g_enemyStage);
+    g_bossGroup = -1;
+    g_warpSent = false;
+    g_warpIn.reset();
+    g_followIn.reset();
+    g_enemyPosIn.clear();
+    g_enemyOwner.clear();
+    g_heldKeys.clear();
+    g_heldLife.clear();
+    g_lifeKnown = false;
 }
 
 
@@ -498,6 +603,60 @@ void handle(const uint8_t* d, int n)
             }
             else if (d[6] == kEventStory && n == 8 + kStoryBytes && d[1] == story_host())
                 g_storySnapIn = StorySnap{d[1], d[7], std::vector<uint8_t>(d + 8, d + n)};
+            else if (d[6] == kEventEnemy && n >= 15 && it != g_remotes.end() && it->second.world == rando::playing_world())
+            {
+                std::array<char, 8> stage;
+                std::memcpy(stage.data(), d + 7, 8);
+                for (int i = 15; i + 5 <= n; i += 5)
+                    g_enemyIn.push_back({stage, {(uint32_t)(d[i] | d[i + 1] << 8 | d[i + 2] << 16 | d[i + 3] << 24), (int8_t)d[i + 4]}});
+            }
+            else if (d[6] == kEventEnemyPos && n >= 19 && it != g_remotes.end() && it->second.world == rando::playing_world())
+            {
+                std::array<char, 8> stage;
+                std::memcpy(stage.data(), d + 7, 8);
+                double now = now_s();
+                float seconds;
+                std::memcpy(&seconds, d + 15, 4);
+                g_stageTime[d[1]] = {stage, seconds, now};
+                if (stage != g_enemyPosStage)
+                {
+                    g_enemyPosIn.clear();
+                    g_enemyPosStage = stage;
+                }
+                for (int i = 19; i + 20 <= n; i += 20)
+                {
+                    uint32_t key;
+                    EnemyPos e{};
+                    std::memcpy(&key, d + i, 4);
+                    std::memcpy(&e.x, d + i + 4, 4);
+                    std::memcpy(&e.y, d + i + 8, 4);
+                    std::memcpy(&e.z, d + i + 12, 4);
+                    std::memcpy(&e.angle, d + i + 16, 2);
+                    std::memcpy(&e.shape, d + i + 18, 2);
+                    e.time = now;
+                    e.from = d[1];
+                    g_enemyPosIn[key] = e;
+                }
+            }
+            else if (d[6] == kEventFollow && n == 36 && it != g_remotes.end() && it->second.world == rando::playing_world())
+            {
+                PendingFollow f{};
+                std::memcpy(f.stage.data(), d + 7, 8);
+                f.room = (int8_t)d[15];
+                std::memcpy(&f.x, d + 16, 4);
+                std::memcpy(&f.z, d + 20, 4);
+                std::memcpy(f.dest, d + 24, 12);
+                f.time = now_s();
+                f.who = it->second.name;
+                g_followIn = f;
+            }
+            else if (d[6] == kEventWarp && n == 20 && it != g_remotes.end() && it->second.world == rando::playing_world())
+            {
+                PendingWarp w{(int8_t)d[7], {}, now_s()};
+                std::memcpy(w.dest, d + 8, 12);
+                g_warpIn = w;
+                log_info("mp: {} warped out of the dungeon after its boss", it->second.name);
+            }
             else if (d[6] == kEventLocal && n >= 15 && it != g_remotes.end() && it->second.world == rando::playing_world())
             {
                 std::array<char, 8> stage;
@@ -1143,6 +1302,51 @@ uint32_t local_addr(int area, int room, int offset)
     return z ? z + kZoneBits + offset : 0;
 }
 
+void mark_stale(bool chests, bool doors, double t)
+{
+    if ((chests && !g_staleChests) || (doors && !g_staleDoors)) g_staleDone.clear();
+    g_staleChests |= chests;
+    g_staleDoors |= doors;
+    g_staleSince = t;
+}
+
+bool chest_proc(uint16_t p) { return p == 0x0124 || p == 0x0125; }
+bool door_proc(uint16_t p) { return p == 0x012C || p == 0x012D || p == 0x012E || p == 0x0130 || p == 0x0131; }
+
+// makes the stale chests and doors again, leaving any the player is right at (opening it, walking through) for later
+void refresh_stale(double t)
+{
+    if (!g_staleChests && !g_staleDoors) return;
+    if (t - g_staleSince < 0.3) return;  // a burst of changes is handled together
+    uint32_t pl = rd32(kPlayerPtr);
+    if (!actors::valid_ptr(pl)) return;
+    auto f32 = [](uint32_t a) { return std::bit_cast<float>(rd32(a)); };
+    float px = f32(pl + kActorPos), py = f32(pl + kActorPos + 4), pz = f32(pl + kActorPos + 8);
+    bool waiting = false;
+    actors::for_each([&](uint32_t a) {
+        uint16_t p = actors::proc_name(a);
+        if (!((g_staleChests && chest_proc(p)) || (g_staleDoors && door_proc(p)))) return true;
+        // a made-again actor has a new address: its placement says it's been done
+        uint64_t spot = (uint64_t)p << 48 ^ (uint64_t)(uint32_t)std::lround(f32(a + actors::kHome)) << 24 ^
+                        (uint64_t)(uint32_t)std::lround(f32(a + actors::kHome + 4)) << 12 ^ (uint32_t)std::lround(f32(a + actors::kHome + 8));
+        if (g_staleDone.count(spot)) return true;
+        float dx = f32(a + kActorPos) - px, dy = f32(a + kActorPos + 4) - py, dz = f32(a + kActorPos + 8) - pz;
+        if (dx * dx + dy * dy + dz * dz < 250.0f * 250.0f)
+        {
+            waiting = true;
+            return true;
+        }
+        g_actorRebuild.push_back(a);
+        g_staleDone.insert(spot);
+        return true;
+    });
+    if (!waiting)
+    {
+        g_staleChests = g_staleDoors = false;
+        g_staleDone.clear();
+    }
+}
+
 // temporary switches: changes go to whoever is in the same stage, applied to the same room's zone
 void sync_local(double t)
 {
@@ -1151,6 +1355,8 @@ void sync_local(double t)
     if (std::memcmp(stage, g_localStage, 8) != 0)
     {
         std::memcpy(g_localStage, stage, 8);
+        g_staleChests = g_staleDoors = false;
+        g_staleDone.clear();
         g_danValid = false;
         for (ZoneShadow& z : g_zoneShadow) z = {};
         g_localRecent.clear();
@@ -1160,6 +1366,7 @@ void sync_local(double t)
         uint32_t key = local_key(area, room, offset);
         uint8_t bits = unmuted(g_localChurn[key], before ^ after, t,
                                std::format("{} switch byte {}:{}", area ? "room" : "dungeon", room, offset));
+        g_lastStoryBitTime = t;  // a room's own bits change with its pickups too (a key an enemy dropped)
         if (!bits) return;
         auto& [mask, when] = g_localRecent[key];
         mask |= bits;
@@ -1204,6 +1411,7 @@ void sync_local(double t)
             for (ZoneShadow& z : g_zoneShadow)
                 if (z.room == c.room) z.bits[c.offset] = nv;
         log_info("mp: {} switch byte {}:{} {:02X} -> {:02X} from the room", c.area ? "room" : "dungeon", c.room, c.offset, v, nv);
+        mark_stale(false, true, t);
     }
     g_localIn.clear();
     if (!changed && t - g_localSent < 0.5) return;
@@ -1227,6 +1435,320 @@ void sync_local(double t)
     if (out.size() > 9) g_storyOut.push_back(std::move(out));
 }
 
+bool share_enemies()
+{
+    std::lock_guard lk(settings::lock());
+    return settings::get().mpShareEnemies;
+}
+
+// boss rooms: their bosses are never removed (their own defeat runs the warp and the heart container), only their
+// damage is shared where they keep it in the usual place
+bool boss_stage(const char* stage)
+{
+    static const char* const kBossStages[] = {"M_DragB", "kinBOSS", "SirenB", "M_DaiB", "kazeB", "GanonJ", "GanonK", "GanonL",
+                                              "GanonM", "GanonN", "M2tower", "M2ganon", "Xboss0", "Xboss1", "Xboss2", "Xboss3"};
+    for (const char* b : kBossStages)
+        if (std::strncmp(stage, b, 8) == 0) return true;
+    // and anything named like one (the dungeons' boss rooms end in B, the refights start with Xboss)
+    std::string name(stage, strnlen(stage, 8));
+    std::string lower = name;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    return lower.find("boss") != std::string::npos || (name.size() > 2 && name.back() == 'B');
+}
+
+// bosses by profile (the actor name table: Btd Gohma, Bwd/Bwds Kalle Demos, Bst Gohdan, Bdk/Bdkobj Helmaroc King,
+// big_pow Jalhalla, Bkm, Fganon Phantom Ganon, Bgn Puppet Ganon, Gnd Ganondorf, Daiocta/Daioeye Big Octo)
+bool boss_proc(uint16_t p)
+{
+    switch (p)
+    {
+    case 0x00EA: case 0x00D9: case 0x00DA: case 0x00F0: case 0x00EE: case 0x00EF: case 0x00D3: case 0x00EB:
+    case 0x00F1: case 0x00F3: case 0x00F6: case 0x00E1: case 0x00E2:
+        return true;
+    default:
+        return false;
+    }
+}
+
+uint32_t enemy_key(uint32_t actor)
+{
+    auto f32 = [](uint32_t a) { return std::bit_cast<float>(rd32(a)); };
+    uint32_t h = 2166136261u;
+    auto mix = [&](uint32_t v) {
+        for (int i = 0; i < 4; i++) h = (h ^ (v >> (i * 8) & 0xFF)) * 16777619u;
+    };
+    mix(actors::proc_name(actor));
+    mix(rd8(actor + actors::kHome + actors::kPlaceRoom));
+    for (int i = 0; i < 3; i++) mix((uint32_t)(int32_t)std::lround(f32(actor + actors::kHome + i * 4)));
+    return h;
+}
+
+// boss rooms aren't moved around: bosses follow scripts that their place is part of
+void sync_enemy_positions(double t, const char* stage, const std::map<uint32_t, uint32_t>& enemies, const std::set<uint32_t>& twice,
+                          bool bossRoom)
+{
+    auto f32 = [](uint32_t a) { return std::bit_cast<float>(rd32(a)); };
+    struct Player { int id; float x, z; };
+    std::vector<Player> players;
+    uint32_t pl = rd32(kPlayerPtr);
+    if (!actors::valid_ptr(pl)) return;
+    players.push_back({g_id, f32(pl + kActorPos), f32(pl + kActorPos + 8)});
+    for (const auto& [id, r] : g_remotes)
+        if (!r.snaps.empty() && r.world == rando::playing_world() && t - r.snaps.back().time < kStale &&
+            std::memcmp(r.snaps.back().view.stage, stage, 8) == 0)
+            players.push_back({id, r.snaps.back().view.x, r.snaps.back().view.z});
+    if (players.size() < 2)
+    {
+        g_enemyOwner.clear();
+        return;
+    }
+    // a boss fight is run by whoever has been in the room longest (it stays theirs while they're there), so the boss
+    // follows one game through the whole fight instead of changing hands as people move around it
+    int bossOwner = g_id;
+    float longest = (float)(t - g_stageSince);
+    for (const Player& p : players)
+    {
+        auto st = g_stageTime.find(p.id);
+        if (p.id == g_id || st == g_stageTime.end() || std::memcmp(st->second.stage.data(), stage, 8) != 0 || t - st->second.received > 2.0)
+            continue;
+        float theirs = st->second.seconds + (float)(t - st->second.received);
+        if (theirs > longest + 0.5f || (std::fabs(theirs - longest) <= 0.5f && p.id < bossOwner)) longest = theirs, bossOwner = p.id;
+    }
+    std::vector<uint8_t> out{kEventEnemyPos};
+    out.insert(out.end(), stage, stage + 8);
+    float here = (float)(t - g_stageSince);
+    out.insert(out.end(), (const uint8_t*)&here, (const uint8_t*)&here + 4);
+    bool sendNow = t - g_enemyPosSent >= 0.1;
+    for (const auto& [key, a] : enemies)
+    {
+        if (twice.count(key)) continue;
+        bool boss = boss_proc(actors::proc_name(a));
+        if (bossRoom && !boss) continue;  // the rest of a boss room (its parts, its minions) runs in each game
+        float ex = f32(a + kActorPos), ez = f32(a + kActorPos + 8);
+        auto dist = [&](const Player& p) { return std::hypot(p.x - ex, p.z - ez); };
+        const Player* best = &players[0];
+        for (const Player& p : players)
+            if (dist(p) < dist(*best) || (dist(p) == dist(*best) && p.id < best->id)) best = &p;
+        // the owner only changes when someone is clearly nearer, so two games don't both (or neither) run it
+        int& owner = g_enemyOwner.try_emplace(key, best->id).first->second;
+        const Player* cur = nullptr;
+        for (const Player& p : players)
+            if (p.id == owner) cur = &p;
+        if (!cur || dist(*best) * 1.25f + 300.0f < dist(*cur)) owner = best->id;
+        if (boss) owner = bossOwner;
+        if (owner == g_id)
+        {
+            if (!sendNow || out.size() > 1180) continue;
+            float pos[3] = {ex, f32(a + kActorPos + 4), ez};
+            int16_t ang[2] = {(int16_t)rd16(a + kActorAngle + 2), (int16_t)rd16(a + kActorShape + 2)};
+            out.insert(out.end(), (const uint8_t*)&key, (const uint8_t*)&key + 4);
+            out.insert(out.end(), (const uint8_t*)pos, (const uint8_t*)pos + 12);
+            out.insert(out.end(), (const uint8_t*)ang, (const uint8_t*)ang + 4);
+            continue;
+        }
+        auto in = g_enemyPosIn.find(key);
+        if (in == g_enemyPosIn.end() || std::memcmp(g_enemyPosStage.data(), stage, 8) != 0 || t - in->second.time > 0.5) continue;
+        const EnemyPos& e = in->second;
+        float dx = e.x - ex, dy = e.y - f32(a + kActorPos + 4), dz = e.z - ez;
+        // ease toward where it is in the owner's game; a big gap (it was knocked away, or just started following) jumps
+        float gap = std::sqrt(dx * dx + dy * dy + dz * dz), k = gap > 600.0f ? 1.0f : 0.35f;
+        static const bool debug = std::getenv("WF_MP_DEBUG") != nullptr;
+        static double s_logged = 0;
+        if (debug && t - s_logged > 1.0)
+        {
+            s_logged = t;
+            log_info("mp: enemy {:04X} follows player {}: {:.0f} apart", actors::proc_name(a), e.from, gap);
+        }
+        wr32(a + kActorPos, std::bit_cast<uint32_t>(ex + dx * k));
+        wr32(a + kActorPos + 4, std::bit_cast<uint32_t>(f32(a + kActorPos + 4) + dy * k));
+        wr32(a + kActorPos + 8, std::bit_cast<uint32_t>(ez + dz * k));
+        auto turn = [&](uint32_t at, int16_t to) {
+            int16_t from = (int16_t)rd16(at);
+            wr16(at, (uint16_t)(int16_t)(from + (int16_t)((int16_t)(to - from) * k)));
+        };
+        turn(a + kActorAngle + 2, e.angle);
+        turn(a + kActorShape + 2, e.shape);
+    }
+    // sent even without enemies of ours in it: the others need how long this game has been here
+    if (sendNow)
+    {
+        g_enemyPosSent = t;
+        g_storyOut.push_back(std::move(out));
+    }
+}
+
+void sync_enemies(double t)
+{
+    char stage[8];
+    for (int i = 0; i < 8; i++) stage[i] = (char)rd8(kStartStage + i);
+    if (std::memcmp(stage, g_enemyStage, 8) != 0)
+    {
+        std::memcpy(g_enemyStage, stage, 8);
+        g_stageSince = t;
+        g_enemies.clear();
+        g_enemyRecent.clear();
+        g_enemyFloor.clear();
+        g_enemyGone.clear();
+    }
+    for (const auto& [from, e] : g_enemyIn)
+    {
+        if (std::memcmp(from.data(), stage, 8) != 0) continue;
+        auto seen = g_enemies.find(e.first);
+        if (seen == g_enemies.end()) continue;  // not loaded here: it'll be a fresh one by the time this game gets there
+        auto [it, fresh] = g_enemyFloor.try_emplace(e.first, EnemyFloor{e.second, seen->second.actor});
+        if (!fresh && it->second.actor == seen->second.actor) it->second.health = std::min(it->second.health, e.second);
+        else if (!fresh) it->second = {e.second, seen->second.actor};
+    }
+    g_enemyIn.clear();
+    bool bossRoom = boss_stage(stage);
+    // this game's enemies; a spawn point two enemies share can't be told apart, so it's left alone
+    std::map<uint32_t, uint32_t> now;
+    std::set<uint32_t> twice;
+    actors::for_each([&](uint32_t a) {
+        bool boss = boss_proc(actors::proc_name(a));
+        if (boss) bossRoom = true;
+        uint32_t flags = rd32(a + kAttnFlags);
+        if ((!(flags & kAttnBattle) && !boss) || flags == 0xFFFFFFFF || actors::proc_name(a) == kProcPlayer || !rd8(a + kMaxHealth)) return true;
+        uint32_t key = enemy_key(a);
+        if (!now.emplace(key, a).second) twice.insert(key);
+        return true;
+    });
+    bool changed = false;
+    for (const auto& [key, a] : now)
+    {
+        if (twice.count(key)) continue;
+        int8_t h = (int8_t)rd8(a + kHealth);
+        auto seen = g_enemies.find(key);
+        if (seen != g_enemies.end() && seen->second.actor == a && h < seen->second.health)
+        {
+            g_enemyRecent[key] = {h, t};
+            changed = true;
+        }
+        // what the others dealt
+        if (auto f = g_enemyFloor.find(key); f != g_enemyFloor.end() && f->second.actor != a) g_enemyFloor.erase(f);
+        else if (f != g_enemyFloor.end() && std::max<int8_t>(f->second.health, 0) < h)
+        {
+            int8_t to = std::max<int8_t>(f->second.health, 0);
+            wr8(a + kHealth, (uint8_t)to);
+            // big enemies (and anything in a boss room) aren't removed: their own defeat may open the way on, so they
+            // stay at no health and fall to the next hit here
+            bool remove = f->second.health <= 0 && !bossRoom && rd8(a + kMaxHealth) < 10 && !g_enemyGone.count(a);
+            if (remove)
+            {
+                g_enemyDelete.push_back(a);
+                g_enemyGone.insert(a);
+            }
+            log_info("mp: enemy {:04X} health {} -> {} from the room{}", actors::proc_name(a), h, to, remove ? ", removed" : "");
+            h = to;
+        }
+        g_enemies[key] = {a, h};
+    }
+    for (auto it = g_enemies.begin(); it != g_enemies.end();)
+        it = now.count(it->first) ? std::next(it) : g_enemies.erase(it);
+    sync_enemy_positions(t, stage, now, twice, bossRoom);
+    if (!changed && t - g_enemySent < 0.5) return;
+    g_enemySent = t;
+    std::vector<uint8_t> out{kEventEnemy};
+    out.insert(out.end(), stage, stage + 8);
+    for (auto it = g_enemyRecent.begin(); it != g_enemyRecent.end();)
+    {
+        auto [h, when] = it->second;
+        if (t - when > kChangeResend)
+        {
+            it = g_enemyRecent.erase(it);
+            continue;
+        }
+        uint32_t k = it->first;
+        out.insert(out.end(), {(uint8_t)k, (uint8_t)(k >> 8), (uint8_t)(k >> 16), (uint8_t)(k >> 24), (uint8_t)h});
+        ++it;
+    }
+    if (out.size() > 9) g_storyOut.push_back(std::move(out));
+}
+
+// after this game beats a dungeon's boss, its warp out takes everyone else in that dungeon along
+void sync_boss_warp(double t, int group, bool playing)
+{
+    if (g_bossGroup >= 0 && (t - g_bossTime > 600.0 || (group != g_bossGroup && group >= 0)))
+    {
+        g_bossGroup = -1;
+        g_warpSent = false;
+    }
+    if (g_bossGroup >= 0 && !g_warpSent && rd8(kNextEnable))
+    {
+        std::vector<uint8_t> out{kEventWarp, (uint8_t)g_bossGroup};
+        for (uint32_t i = 0; i < 12; i++) out.push_back(rd8(kNextStage + i));
+        g_storyOut.push_back(std::move(out));
+        g_warpSent = true;
+        log_info("mp: warping out after the boss, taking the others in the dungeon along");
+    }
+    if (!g_warpIn) return;
+    if (t - g_warpIn->time > 30.0)
+    {
+        g_warpIn.reset();
+        return;
+    }
+    if (!playing || !in_game_stage() || rd8(kNextEnable)) return;
+    if (group == g_warpIn->group)
+    {
+        for (uint32_t i = 0; i < 12; i++) wr8(kNextStage + i, g_warpIn->dest[i]);
+        wr8(kNextEnable, 1);
+        g_ownRequest = true;
+        log_info("mp: following the warp out of the dungeon");
+    }
+    g_warpIn.reset();
+}
+
+bool share_cutscenes()
+{
+    std::lock_guard lk(settings::lock());
+    return settings::get().mpShareCutscenes;
+}
+
+// a story cutscene started here with a stage change goes to the others in the same place; one started by someone else
+// in the same place takes this game along
+void sync_cutscene_follow(double t, bool playing)
+{
+    bool up = rd8(kNextEnable) != 0;
+    bool ending = up && ending_stage(kNextStage);
+    if (up && !g_nextWasSet && !g_ownRequest && playing && (rd8(kNextStage + 11) != 0xFF || ending))
+    {
+        uint32_t pl = rd32(kPlayerPtr);
+        std::vector<uint8_t> out{kEventFollow};
+        for (uint32_t i = 0; i < 8; i++) out.push_back(rd8(kStartStage + i));
+        out.push_back(ending ? (uint8_t)kEveryone : actors::valid_ptr(pl) ? rd8(pl + kActorRoom) : 0xFF);
+        float where[2] = {actors::valid_ptr(pl) ? std::bit_cast<float>(rd32(pl + kActorPos)) : 0.0f,
+                          actors::valid_ptr(pl) ? std::bit_cast<float>(rd32(pl + kActorPos + 8)) : 0.0f};
+        out.insert(out.end(), (const uint8_t*)where, (const uint8_t*)where + 8);
+        if (ending) log_info("mp: the ending starts here, taking everyone along");
+        for (uint32_t i = 0; i < 12; i++) out.push_back(rd8(kNextStage + i));
+        g_storyOut.push_back(std::move(out));
+        log_info("mp: a cutscene starts here (layer {}), taking the others here along", (int8_t)rd8(kNextStage + 11));
+    }
+    if (!up) g_ownRequest = false;
+    g_nextWasSet = up;
+    if (!g_followIn) return;
+    if (t - g_followIn->time > 10.0)
+    {
+        g_followIn.reset();
+        return;
+    }
+    if (!playing || !in_game_stage() || up) return;
+    uint32_t pl = rd32(kPlayerPtr);
+    bool here = true;
+    for (int i = 0; i < 8 && here; i++) here = (char)rd8(kStartStage + i) == g_followIn->stage[i];
+    bool close = here && actors::valid_ptr(pl) && (int8_t)rd8(pl + kActorRoom) == g_followIn->room &&
+                std::hypot(std::bit_cast<float>(rd32(pl + kActorPos)) - g_followIn->x,
+                           std::bit_cast<float>(rd32(pl + kActorPos + 8)) - g_followIn->z) < kFollowReach;
+    if (g_followIn->room == kEveryone || close)
+    {
+        for (uint32_t i = 0; i < 12; i++) wr8(kNextStage + i, g_followIn->dest[i]);
+        wr8(kNextEnable, 1);
+        g_ownRequest = true;
+        log_info("mp: going along into {}'s cutscene", g_followIn->who);
+    }
+    g_followIn.reset();
+}
+
 void sync_story(bool playing)
 {
     if (!g_joined || !share_story())
@@ -1245,6 +1767,8 @@ void sync_story(bool playing)
     }
     // only while a stage has been playing steadily: around stage changes the game moves memory between slots
     int group = stage_group();
+    if (g_storyAdopted && share_enemies()) sync_boss_warp(now_s(), group, playing);
+    if (g_storyAdopted && share_cutscenes()) sync_cutscene_follow(now_s(), playing);
     bool steady = playing && in_game_stage() && items_valid() && !rd8(kNextEnable) && group == g_storyGroup;
     g_storyGroup = group;
     g_storyStable = steady ? g_storyStable + 1 : 0;
@@ -1273,14 +1797,53 @@ void sync_story(bool playing)
     for (int i = 0; i < kStoryBytes; i++)
     {
         if (now[i] == g_storyShadow[i]) continue;
-        uint8_t bits = now[i] ^ g_storyShadow[i];
+        uint8_t before = g_storyShadow[i], bits = now[i] ^ before;
         static const bool debug = std::getenv("WF_MP_DEBUG") != nullptr;
         if (debug) log_info("mp: story byte {:03X} {:02X} -> {:02X}", i, g_storyShadow[i], now[i]);
         g_storyShadow[i] = now[i];
         bits = unmuted(g_churn[i], bits, t, std::format("story byte {:03X}", i));
+        bool keyCount = i >= kStoryMemory && i < kStoryOcean && (i - kStoryMemory) % kMemBytes == 0x20;
+        if (!keyCount && bits) g_lastStoryBitTime = t;
+        // a key gained is held back a moment: one with nothing else changing around it came from a chest or key the
+        // room already took (still showing here), and is taken back
+        if (keyCount && bits && g_storyAdopted && share_story() && now[i] > before)
+        {
+            g_heldKeys.push_back({i, before, now[i], t});
+            continue;
+        }
+        // a dungeon's boss beaten here (its dungeon item bit 3)
+        if (i >= kStoryMemory && i < kStoryOcean && (i - kStoryMemory) % kMemBytes == 0x21 && (bits & now[i] & 8))
+        {
+            g_bossGroup = (i - kStoryMemory) / kMemBytes;
+            g_bossTime = t;
+            g_warpSent = false;
+            log_info("mp: beat the boss of stage group {}", g_bossGroup);
+        }
         if (!bits || !g_storyAdopted) continue;
         g_recent[i] = {(uint8_t)(g_recent[i].first | bits), t};
         changed = true;
+    }
+    for (auto it = g_heldKeys.begin(); it != g_heldKeys.end();)
+    {
+        if (t - it->time < 3.0)
+        {
+            ++it;
+            continue;
+        }
+        uint32_t a = story_addr(it->offset, group);
+        uint8_t cur = rd8(a);
+        if (cur == it->after && g_lastStoryBitTime < it->time - 6.0)
+        {
+            wr8(a, it->before);
+            g_storyShadow[it->offset] = now[it->offset] = it->before;
+            log_info("mp: took back a key the room already had (picked up a second time here)");
+        }
+        else if (cur != it->before)
+        {
+            g_recent[it->offset] = {(uint8_t)(g_recent[it->offset].first | (it->before ^ cur)), t};
+            changed = true;
+        }
+        it = g_heldKeys.erase(it);
     }
     // the host's story: on joining, after this game loads a file, and after the host loads theirs again
     if (g_storySnapIn && !host && g_storySnapIn->from == g_storyFrom && g_storySnapIn->epoch != g_storyEpochSeen)
@@ -1309,6 +1872,7 @@ void sync_story(bool playing)
             for (uint32_t i = 0; i < 12; i++) wr8(kNextStage + i, rd8(kStartStage + i));
             wr8(kNextStage + 11, 0xFF);
             wr8(kNextEnable, 1);
+            g_ownRequest = true;
             log_info("mp: reloading the area for the new story");
         }
         return;
@@ -1325,11 +1889,20 @@ void sync_story(bool playing)
             {
                 wr8(a, nv);
                 log_info("mp: story byte {:03X} {:02X} -> {:02X} from the room", c.offset, v, nv);
+                // the area being played: its chests (treasure bits) or doors (switches, dungeon items) may show it wrong
+                if (c.offset >= kStoryMemory && c.offset < kStoryOcean && (c.offset - kStoryMemory) / kMemBytes == group)
+                {
+                    int b = (c.offset - kStoryMemory) % kMemBytes;
+                    if (b < 4) mark_stale(true, false, t);
+                    else if (b < 0x14 || b == 0x20 || b == 0x21) mark_stale(false, true, t);
+                }
             }
             g_storyShadow[c.offset] = nv;
         }
     g_changesIn.clear();
     if (g_storyAdopted) sync_local(t);
+    refresh_stale(t);
+    if (g_storyAdopted && share_enemies()) sync_enemies(t);
     // send changes now, and resend the latest state of recently changed bits for a while (packets can be lost; a
     // repeat is harmless since it carries the bits' current values)
     if (changed || (t - g_changesSent > 0.5))
@@ -1363,13 +1936,81 @@ void sync_items(bool playing)
     if (!g_joined || !playing || !in_game_stage() || !items_valid() || !share_items())
     {
         g_invIn.clear();
+        if (!in_game_stage() || !items_valid())
+        {
+            g_lifeKnown = false, g_heldLife.clear();
+            // another file may come: what this one's story took doesn't carry over
+            g_invLocalKnown = false;
+            std::fill(std::begin(g_takenSlot), std::end(g_takenSlot), false);
+            std::fill(std::begin(g_takenCollect), std::end(g_takenCollect), 0);
+            g_takenPearls = 0;
+        }
         return;
+    }
+    double t = now_s();
+    // a heart container or piece gained here with nothing else in the story changing around it was one the room
+    // already took (still showing here): it's taken back, and not passed on meanwhile
+    bool checkTaken = share_story() && g_storyAdopted;
+    uint16_t life = rd16(kMaxLife);
+    if (!g_lifeKnown) g_lifeSeen = life, g_lifeKnown = true;
+    if (life > g_lifeSeen && checkTaken) g_heldLife.push_back({(uint16_t)(life - g_lifeSeen), t});
+    {
+        Inventory cur = read_inventory();
+        if (g_invLocalKnown)
+        {
+            for (int i = 0; i < kItemSlotCount; i++)
+            {
+                if (is_bottle(i)) continue;
+                if (g_invLocal.items[i] != 0xFF && cur.items[i] == 0xFF && !g_takenSlot[i])
+                {
+                    g_takenSlot[i] = true;
+                    log_info("mp: the story took item {:02X} (slot {}) here; the room won't hand it back", g_invLocal.items[i], i);
+                }
+                if (cur.items[i] != 0xFF) g_takenSlot[i] = false;
+            }
+            for (int c = 0; c < kCollectCount; c++)
+            {
+                uint8_t lost = g_invLocal.collect[c] & ~cur.collect[c];
+                if (lost) log_info("mp: the story took equipment {} ({:02X}) here; the room won't hand it back", c, lost);
+                // the story giving any of it back (the sword found again) ends the hold, upgrades and all
+                bool gained = cur.collect[c] & ~g_invLocal.collect[c];
+                g_takenCollect[c] = gained ? 0 : (uint8_t)((g_takenCollect[c] | lost) & ~cur.collect[c]);
+            }
+            g_takenPearls = (uint8_t)((g_takenPearls | (g_invLocal.pearls & ~cur.pearls)) & ~cur.pearls);
+        }
     }
     for (const Inventory& in : g_invIn) merge_inventory(in);
     g_invIn.clear();
+    g_invLocal = read_inventory();
+    g_invLocalKnown = true;
+    uint16_t held = 0;
+    for (auto it = g_heldLife.begin(); it != g_heldLife.end();)
+    {
+        if (t - it->time < 3.0)
+        {
+            held += it->amount;
+            ++it;
+            continue;
+        }
+        if (g_lastStoryBitTime < it->time - 6.0)
+        {
+            uint16_t ml = rd16(kMaxLife), to = ml > it->amount ? (uint16_t)(ml - it->amount) : ml;
+            wr16(kMaxLife, to);
+            if (rd16(kLife) > to) wr16(kLife, to);
+            log_info("mp: took back {} quarter hearts the room already had (picked up a second time here)", it->amount);
+        }
+        it = g_heldLife.erase(it);
+    }
+    g_lifeSeen = rd16(kMaxLife);
     // resent every few seconds too, so someone who joins later catches up
     Inventory now = read_inventory();
-    double t = now_s();
+    if (held)
+    {
+        uint16_t shown = (uint16_t)(now.maxLife[0] << 8 | now.maxLife[1]);
+        shown = shown > held ? (uint16_t)(shown - held) : shown;
+        now.maxLife[0] = (uint8_t)(shown >> 8);
+        now.maxLife[1] = (uint8_t)shown;
+    }
     if (!g_invAnnounced || memcmp(&now, &g_invSent, sizeof now) != 0 || t - g_invSentTime > 3.0)
     {
         g_invOut = now;
@@ -1377,6 +2018,117 @@ void sync_items(bool playing)
         g_invSentTime = t;
         g_invAnnounced = true;
     }
+}
+
+void run_game_calls(wf::PPCContext& ctx)
+{
+    std::vector<uint32_t> remove, rebuild;
+    {
+        std::lock_guard lk(g_lock);
+        remove.swap(g_enemyDelete);
+        rebuild.swap(g_actorRebuild);
+    }
+    // WF_REBUILD=<frame>:<proc>[,...]: makes every actor of that profile again at that frame (testing)
+    static const char* spec = std::getenv("WF_REBUILD");
+    if (spec)
+    {
+        static uint32_t s_last = 0;
+        uint32_t frame = g_frameNumber;
+        for (const char* p = spec; p && *p;)
+        {
+            unsigned f = 0, proc = 0;
+            if (std::sscanf(p, "%u:%x", &f, &proc) == 2 && f > s_last && f <= frame)
+                actors::for_each([&](uint32_t a) {
+                    if (actors::proc_name(a) == proc) rebuild.push_back(a);
+                    return true;
+                });
+            p = std::strchr(p, ',');
+            if (p) p++;
+        }
+        s_last = frame;
+    }
+    // WF_SET_HEALTH=<frame>:<proc>:<health>: sets that health on every actor of that profile at that frame (testing)
+    static const char* setHealth = std::getenv("WF_SET_HEALTH");
+    if (setHealth)
+    {
+        static uint32_t s_last = 0;
+        unsigned f = 0, proc = 0, h = 0;
+        if (std::sscanf(setHealth, "%u:%x:%u", &f, &proc, &h) == 3 && f > s_last && f <= g_frameNumber)
+            actors::for_each([&](uint32_t a) {
+                if (actors::proc_name(a) == proc) wr8(a + kHealth, (uint8_t)h);
+                return true;
+            });
+        s_last = g_frameNumber;
+    }
+    if (remove.empty() && rebuild.empty()) return;
+    // the caller's registers go on to the game's own frame function: keep them
+    uint32_t r[32], ctr = ctx.ctr, fpscr = ctx.fpscr;
+    uint8_t cr[32], xer[4] = {ctx.xer_so, ctx.xer_ov, ctx.xer_ca, ctx.xer_bc};
+    decltype(ctx.f) f;
+    std::memcpy(r, ctx.r, sizeof r);
+    std::memcpy(cr, ctx.cr, sizeof cr);
+    std::memcpy(f, ctx.f, sizeof f);
+    for (uint32_t a : remove)
+    {
+        // still alive and on the actor list (it may have died or unloaded since)
+        bool listed = false;
+        actors::for_each([&](uint32_t x) { return !(listed = x == a); });
+        if (listed && (int8_t)rd8(a + kHealth) <= 0) hle::call_guest(ctx, kFpcDtDelete, {a});
+    }
+    // made again from where the stage placed them, so they read the save as it is now (a chest a partner opened opens,
+    // a door a partner unlocked unlocks): the old one is removed and a new one asked for in its place
+    for (uint32_t a : rebuild)
+    {
+        bool listed = false;
+        actors::for_each([&](uint32_t x) { return !(listed = x == a); });
+        if (!listed) continue;
+        uint16_t proc = actors::proc_name(a);
+        uint32_t param = rd32(a + kParam);
+        int8_t room = (int8_t)rd8(a + kOrigRoom), subtype = (int8_t)rd8(a + kSubtype);
+        uint32_t layer = rd32(a + kProcLayer);
+        uint16_t setId = rd16(a + kSetId);
+        uint8_t place[32];  // pos (12), angle (6, padded to 8), scale (12)
+        for (int i = 0; i < 12; i++) place[i] = rd8(a + actors::kHome + i);
+        for (int i = 0; i < 6; i++) place[12 + i] = rd8(a + kOrigAngle + i);
+        place[18] = place[19] = 0;
+        for (int i = 0; i < 12; i++) place[20 + i] = rd8(a + kScale + i);
+        hle::call_guest(ctx, kFpcDtDelete, {a});
+        // the placement goes in a frame of our own below the stack pointer, with a back chain and the ninth argument
+        // (unused without a create function) zeroed
+        uint32_t sp = ctx.r[1], frame = sp - 0x60;
+        wr32(frame, sp);
+        wr32(frame + 8, 0);
+        for (int i = 0; i < 32; i++) wr8(frame + 0x20 + i, place[i]);
+        ctx.r[1] = frame;
+        // made in the layer the old one lived in (the stage's), not whatever layer is current between frames
+        uint32_t oldLayer = rd32(kCurrentLayer);
+        if (actors::valid_ptr(layer)) wr32(kCurrentLayer, layer);
+        uint32_t heap = hle::call_guest(ctx, kGameHeap), prevHeap = 0, slot = rd32(kSavedHeap);
+        if (heap)
+        {
+            prevHeap = hle::call_guest(ctx, kSetCurrentHeap, {rd32(kHeapMgr), heap});
+            wr32(kSavedHeap, prevHeap);
+        }
+        uint32_t id = hle::call_guest(ctx, kFopAcmCreate, {proc, param, frame + 0x20, (uint32_t)(int32_t)room, frame + 0x2C,
+                                                            frame + 0x34, (uint32_t)(int32_t)subtype, 0});
+        if (heap)
+        {
+            // the save slot is used up when the making restored the heap itself; otherwise go back by hand
+            if (rd32(kSavedHeap) == prevHeap) hle::call_guest(ctx, kSetCurrentHeap, {rd32(kHeapMgr), prevHeap});
+            wr32(kSavedHeap, slot);
+        }
+        wr32(kCurrentLayer, oldLayer);
+        ctx.r[1] = sp;
+        // fopAcM_create hands back the new actor; it keeps the stage's set number like the one it replaces
+        if (actors::valid_ptr(id)) wr16(id + kSetId, setId);
+        log_info("mp: made actor {:04X} again ({:08X}) as {:08X}", proc, param, id);
+    }
+    std::memcpy(ctx.r, r, sizeof r);
+    std::memcpy(ctx.cr, cr, sizeof cr);
+    std::memcpy(ctx.f, f, sizeof f);
+    ctx.ctr = ctr;
+    ctx.fpscr = fpscr;
+    ctx.xer_so = xer[0], ctx.xer_ov = xer[1], ctx.xer_ca = xer[2], ctx.xer_bc = xer[3];
 }
 
 void tick()
