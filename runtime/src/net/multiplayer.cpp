@@ -129,6 +129,10 @@ constexpr uint32_t kLiveMemory = kSave + 0x778, kStageNo = kSave + 0x79C;
 constexpr uint32_t kDanSwitches = kSave + 0x7A0, kZones = kSave + 0x7A8;
 constexpr int kDanBytes = 8, kZoneSize = 0x4C, kZoneCount = 32, kZoneBits = 2, kZoneBitBytes = 10;
 constexpr uint32_t kNextStage = 0x104741F0, kNextEnable = 0x104741FC;
+// the event system's mode (dEvt_control_c): 0 while the player plays, set during cutscenes, talks and stage changes
+constexpr uint32_t kEventMode = 0x10474342;
+std::atomic<bool> g_inEvent{false};
+bool in_event() { return rd8(kEventMode) != 0; }
 constexpr int kItemSlotCount = 21, kFirstBottle = 14, kBottles = 4, kCollectCount = 5;
 constexpr uint8_t kEmptyBottle = 0x50;
 constexpr uint8_t kEventWorld = 2;      // payload: the sender's rando::playing_world() text, resent every few seconds
@@ -312,7 +316,7 @@ constexpr uint8_t kEventLocal = 6;   // payload: stage[8], {u8 area (0 dungeon, 
 constexpr double kChangeResend = 2.0;
 
 struct StoryChange { uint16_t offset; uint8_t set, clear; };
-struct Churn { double since = 0; uint8_t count[8] = {}; uint8_t muted = 0; };  // per bit
+struct Churn { double since = 0; uint8_t count[8] = {}; uint8_t muted = 0; double lastFlip = 0; };  // per bit
 std::array<uint8_t, kStoryBytes> g_storyShadow{};
 std::array<Churn, kStoryBytes> g_churn{};
 std::array<std::pair<uint8_t, double>, kStoryBytes> g_recent{};  // bits changed here lately and when, resent a while
@@ -410,6 +414,24 @@ bool g_nextWasSet = false;   // the stage change request was already up last tic
 bool g_ownRequest = false;   // the request up now is one this code made (not to be passed on)
 std::vector<StoryChange> g_changesIn;
 std::vector<std::vector<uint8_t>> g_storyOut;  // event kind + payload
+// warps and cutscene follows are sent three times over a second (a lost packet would leave someone behind) with an id,
+// and applied once
+struct Resend { std::vector<uint8_t> packet; int left; double next; };
+std::vector<Resend> g_resends;
+uint16_t g_onceId = 0;
+std::set<std::pair<int, uint16_t>> g_onceSeen;
+void send_once(std::vector<uint8_t> packet, double t)
+{
+    uint16_t id = ++g_onceId;
+    packet.insert(packet.begin() + 1, {(uint8_t)id, (uint8_t)(id >> 8)});
+    g_storyOut.push_back(packet);
+    g_resends.push_back({std::move(packet), 2, t + 0.3});
+}
+// the id in front of a once-only event's payload; false when it was already applied
+bool first_time(int from, const uint8_t* d)
+{
+    return g_onceSeen.insert({from, (uint16_t)(d[0] | d[1] << 8)}).second;
+}
 bool g_storyBaseline = false, g_storyAdopted = false;
 int g_storyStable = 0, g_storyGroup = -2;
 double g_storySent = 0, g_changesSent = 0;
@@ -463,6 +485,8 @@ void reset_story()
     g_warpSent = false;
     g_warpIn.reset();
     g_followIn.reset();
+    g_resends.clear();
+    g_onceSeen.clear();
     g_enemyPosIn.clear();
     g_enemyOwner.clear();
     g_heldKeys.clear();
@@ -638,8 +662,10 @@ void handle(const uint8_t* d, int n)
                     g_enemyPosIn[key] = e;
                 }
             }
-            else if (d[6] == kEventFollow && n == 36 && it != g_remotes.end() && it->second.world == rando::playing_world())
+            else if (d[6] == kEventFollow && n == 38 && it != g_remotes.end() && it->second.world == rando::playing_world() &&
+                     first_time(d[1], d + 7))
             {
+                d += 2;
                 PendingFollow f{};
                 std::memcpy(f.stage.data(), d + 7, 8);
                 f.room = (int8_t)d[15];
@@ -650,8 +676,10 @@ void handle(const uint8_t* d, int n)
                 f.who = it->second.name;
                 g_followIn = f;
             }
-            else if (d[6] == kEventWarp && n == 20 && it != g_remotes.end() && it->second.world == rando::playing_world())
+            else if (d[6] == kEventWarp && n == 22 && it != g_remotes.end() && it->second.world == rando::playing_world() &&
+                     first_time(d[1], d + 7))
             {
+                d += 2;
                 PendingWarp w{(int8_t)d[7], {}, now_s()};
                 std::memcpy(w.dest, d + 8, 12);
                 g_warpIn = w;
@@ -1271,6 +1299,7 @@ bool share_story()
 // counts a byte's changed bits; a bit that changes more than 8 times in 20 s stops being shared. Returns the rest
 uint8_t unmuted(Churn& c, uint8_t bits, double t, const std::string& what)
 {
+    if (bits) c.lastFlip = t;
     if (t - c.since > 20.0)
     {
         c.since = t;
@@ -1283,6 +1312,18 @@ uint8_t unmuted(Churn& c, uint8_t bits, double t, const std::string& what)
             log_info("mp: {} bit {} keeps changing, no longer shared", what, b);
         }
     return bits & ~c.muted;
+}
+
+// a bit muted for flipping (a held switch, a flag that follows where each player is) that has then been quiet for two
+// minutes is shared again: a burst during one busy moment doesn't keep a story flag apart for the whole session
+constexpr double kUnmuteAfter = 120.0;
+template <typename Each> void unmute_quiet(Churn& c, double t, Each&& onUnmute)
+{
+    if (!c.muted || t - c.lastFlip < kUnmuteAfter) return;
+    uint8_t bits = c.muted;
+    c.muted = 0;
+    std::fill(std::begin(c.count), std::end(c.count), 0);
+    onUnmute(bits);
 }
 
 uint32_t local_key(int area, int room, int offset) { return (uint32_t)area << 16 | (uint32_t)(uint8_t)room << 8 | (uint32_t)offset; }
@@ -1317,7 +1358,7 @@ bool door_proc(uint16_t p) { return p == 0x012C || p == 0x012D || p == 0x012E ||
 void refresh_stale(double t)
 {
     if (!g_staleChests && !g_staleDoors) return;
-    if (t - g_staleSince < 0.3) return;  // a burst of changes is handled together
+    if (t - g_staleSince < 0.3 || in_event()) return;  // a burst of changes is handled together; not mid-cutscene
     uint32_t pl = rd32(kPlayerPtr);
     if (!actors::valid_ptr(pl)) return;
     auto f32 = [](uint32_t a) { return std::bit_cast<float>(rd32(a)); };
@@ -1458,6 +1499,9 @@ bool boss_stage(const char* stage)
 
 // bosses by profile (the actor name table: Btd Gohma, Bwd/Bwds Kalle Demos, Bst Gohdan, Bdk/Bdkobj Helmaroc King,
 // big_pow Jalhalla, Bkm, Fganon Phantom Ganon, Bgn Puppet Ganon, Gnd Ganondorf, Daiocta/Daioeye Big Octo)
+// enemies that grab Link (Wallmaster/Floormaster, ReDead): moving or removing one mid-grab would leave Link stuck
+bool grabber_proc(uint16_t p) { return p == 0x0077 || p == 0x00E0; }
+
 bool boss_proc(uint16_t p)
 {
     switch (p)
@@ -1524,6 +1568,7 @@ void sync_enemy_positions(double t, const char* stage, const std::map<uint32_t, 
         if (twice.count(key)) continue;
         bool boss = boss_proc(actors::proc_name(a));
         if (bossRoom && !boss) continue;  // the rest of a boss room (its parts, its minions) runs in each game
+        if (grabber_proc(actors::proc_name(a))) continue;
         float ex = f32(a + kActorPos), ez = f32(a + kActorPos + 8);
         auto dist = [&](const Player& p) { return std::hypot(p.x - ex, p.z - ez); };
         const Player* best = &players[0];
@@ -1552,6 +1597,10 @@ void sync_enemy_positions(double t, const char* stage, const std::map<uint32_t, 
         float dx = e.x - ex, dy = e.y - f32(a + kActorPos + 4), dz = e.z - ez;
         // ease toward where it is in the owner's game; a big gap (it was knocked away, or just started following) jumps
         float gap = std::sqrt(dx * dx + dy * dy + dz * dz), k = gap > 600.0f ? 1.0f : 0.35f;
+        // a boss far from where the owner's is is in another part of its script (burrowed, up on the ceiling): left
+        // alone rather than pulled across
+        if (boss && gap > 1500.0f) continue;
+        if (boss) k = 0.35f;
         static const bool debug = std::getenv("WF_MP_DEBUG") != nullptr;
         static double s_logged = 0;
         if (debug && t - s_logged > 1.0)
@@ -1632,7 +1681,8 @@ void sync_enemies(double t)
             wr8(a + kHealth, (uint8_t)to);
             // big enemies (and anything in a boss room) aren't removed: their own defeat may open the way on, so they
             // stay at no health and fall to the next hit here
-            bool remove = f->second.health <= 0 && !bossRoom && rd8(a + kMaxHealth) < 10 && !g_enemyGone.count(a);
+            bool remove = f->second.health <= 0 && !bossRoom && rd8(a + kMaxHealth) < 10 && !g_enemyGone.count(a) &&
+                          !grabber_proc(actors::proc_name(a)) && !in_event();
             if (remove)
             {
                 g_enemyDelete.push_back(a);
@@ -1677,17 +1727,17 @@ void sync_boss_warp(double t, int group, bool playing)
     {
         std::vector<uint8_t> out{kEventWarp, (uint8_t)g_bossGroup};
         for (uint32_t i = 0; i < 12; i++) out.push_back(rd8(kNextStage + i));
-        g_storyOut.push_back(std::move(out));
+        send_once(std::move(out), t);
         g_warpSent = true;
         log_info("mp: warping out after the boss, taking the others in the dungeon along");
     }
     if (!g_warpIn) return;
-    if (t - g_warpIn->time > 30.0)
+    if (t - g_warpIn->time > 120.0)
     {
         g_warpIn.reset();
         return;
     }
-    if (!playing || !in_game_stage() || rd8(kNextEnable)) return;
+    if (!playing || !in_game_stage() || rd8(kNextEnable) || in_event()) return;
     if (group == g_warpIn->group)
     {
         for (uint32_t i = 0; i < 12; i++) wr8(kNextStage + i, g_warpIn->dest[i]);
@@ -1721,18 +1771,18 @@ void sync_cutscene_follow(double t, bool playing)
         out.insert(out.end(), (const uint8_t*)where, (const uint8_t*)where + 8);
         if (ending) log_info("mp: the ending starts here, taking everyone along");
         for (uint32_t i = 0; i < 12; i++) out.push_back(rd8(kNextStage + i));
-        g_storyOut.push_back(std::move(out));
+        send_once(std::move(out), t);
         log_info("mp: a cutscene starts here (layer {}), taking the others here along", (int8_t)rd8(kNextStage + 11));
     }
     if (!up) g_ownRequest = false;
     g_nextWasSet = up;
     if (!g_followIn) return;
-    if (t - g_followIn->time > 10.0)
+    if (t - g_followIn->time > 30.0)
     {
         g_followIn.reset();
         return;
     }
-    if (!playing || !in_game_stage() || up) return;
+    if (!playing || !in_game_stage() || up || in_event()) return;
     uint32_t pl = rd32(kPlayerPtr);
     bool here = true;
     for (int i = 0; i < 8 && here; i++) here = (char)rd8(kStartStage + i) == g_followIn->stage[i];
@@ -1769,6 +1819,32 @@ void sync_story(bool playing)
     int group = stage_group();
     if (g_storyAdopted && share_enemies()) sync_boss_warp(now_s(), group, playing);
     if (g_storyAdopted && share_cutscenes()) sync_cutscene_follow(now_s(), playing);
+    {
+        double now = now_s();
+        for (auto it = g_resends.begin(); it != g_resends.end();)
+        {
+            if (now < it->next)
+            {
+                ++it;
+                continue;
+            }
+            g_storyOut.push_back(it->packet);
+            it->next = now + 0.3;
+            it = --it->left > 0 ? std::next(it) : g_resends.erase(it);
+        }
+        static double s_sweep = 0;
+        if (now - s_sweep > 5.0)
+        {
+            s_sweep = now;
+            for (int i = 0; i < kStoryBytes; i++)
+                unmute_quiet(g_churn[i], now, [&](uint8_t bits) {
+                    log_info("mp: story byte {:03X} quiet again, shared again", i);
+                    g_recent[i] = {(uint8_t)(g_recent[i].first | bits), now};  // and its value goes out
+                });
+            for (auto& [key, c] : g_localChurn)
+                unmute_quiet(c, now, [&](uint8_t) {});
+        }
+    }
     bool steady = playing && in_game_stage() && items_valid() && !rd8(kNextEnable) && group == g_storyGroup;
     g_storyGroup = group;
     g_storyStable = steady ? g_storyStable + 1 : 0;
@@ -1848,7 +1924,7 @@ void sync_story(bool playing)
     // the host's story: on joining, after this game loads a file, and after the host loads theirs again
     if (g_storySnapIn && !host && g_storySnapIn->from == g_storyFrom && g_storySnapIn->epoch != g_storyEpochSeen)
         g_storyAdopted = false;
-    if (!g_storyAdopted && g_storySnapIn)
+    if (!g_storyAdopted && g_storySnapIn && !in_event())
     {
         g_storyFrom = g_storySnapIn->from;
         g_storyEpochSeen = g_storySnapIn->epoch;
@@ -2146,6 +2222,7 @@ void tick()
             said = true;
         }
     uint32_t actor = rd32(kPlayerPtr);
+    g_inEvent = in_event();
     std::lock_guard lk(g_lock);
     sync_items(actor != 0);
     sync_story(actor != 0);
@@ -2208,7 +2285,7 @@ void render_overlay()
     }
     if (!haveCamera) return;
     ImDrawList* dl = ImGui::GetForegroundDrawList();
-    if (!g_localValid || !show_names() || ui::menu::is_open()) return;
+    if (!g_localValid || !show_names() || ui::menu::is_open() || g_inEvent) return;
     for (auto& [id, r] : g_remotes)
     {
         LinkView v;
@@ -2331,7 +2408,8 @@ void remote_placements(std::vector<Placement>& out)
     out.clear();
     double t = now_s() - kInterpDelay;
     std::lock_guard lk(g_lock);
-    if (!g_localValid) return;
+    // during this game's own cutscenes and talks the others stay out of the shot
+    if (!g_localValid || g_inEvent) return;
     static const bool ghost = std::getenv("WF_MP_GHOST") != nullptr;
     if (ghost)
     {
